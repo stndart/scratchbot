@@ -1,0 +1,19 @@
+[Unit]
+Description=Scratchwall Telegram ingest bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/var/lib/scratchwall-telegram
+EnvironmentFile=/etc/scratchwall/telegram.env
+ExecStart=/usr/local/bin/scratchwall-telegram
+Restart=on-failure
+RestartSec=5
+
+# Optional Docker instead of this unit:
+# docker run --restart unless-stopped --env-file /etc/scratchwall/telegram.env \
+#   -v /var/lib/scratchwall-telegram:/data scratchwall-telegram
+
+[Install]
+WantedBy=multi-user.target
