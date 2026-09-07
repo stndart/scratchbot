@@ -5,7 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=scratchwall-telegram
+Group=scratchwall-telegram
 WorkingDirectory=/var/lib/scratchwall-telegram
+StateDirectory=scratchwall-telegram
 EnvironmentFile=/etc/scratchwall/telegram.env
 ExecStart=/usr/local/bin/scratchwall-telegram
 Restart=on-failure

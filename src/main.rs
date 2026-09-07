@@ -1,4 +1,5 @@
 mod config;
+mod service;
 mod telegram;
 
 use anyhow::Result;
@@ -17,6 +18,22 @@ use telegram::{HandleError, Telegram, post_ingest, request_telegram_bind};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    match std::env::args().skip(1).collect::<Vec<_>>().as_slice() {
+        [] => run().await,
+        [flag] if flag == "--install" => service::install(),
+        [flag] if flag == "--uninstall" => service::uninstall(),
+        [flag] if flag == "--help" || flag == "-h" => {
+            service::print_help();
+            Ok(())
+        }
+        _ => {
+            service::print_help();
+            anyhow::bail!("invalid arguments");
+        }
+    }
+}
+
+async fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
