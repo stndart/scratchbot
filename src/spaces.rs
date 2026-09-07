@@ -6,37 +6,57 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const MAX_SPACE_NAME: usize = 200;
+const MAX_NAME: usize = 200;
 
 #[derive(Default, Serialize, Deserialize)]
-struct SpaceFile {
+struct BindingsFile {
     #[serde(default)]
     spaces: HashMap<String, String>,
+    #[serde(default)]
+    logins: HashMap<String, String>,
 }
 
 pub struct SpaceBindings {
     path: PathBuf,
-    by_user: HashMap<i64, String>,
+    spaces: HashMap<i64, String>,
+    logins: HashMap<i64, String>,
 }
 
 impl SpaceBindings {
     pub fn load(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
-        let by_user = match fs::read_to_string(&path) {
-            Ok(text) => parse_space_file(&text)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+        let (spaces, logins) = match fs::read_to_string(&path) {
+            Ok(text) => parse_bindings_file(&text)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                (HashMap::new(), HashMap::new())
+            }
             Err(error) => return Err(error.into()),
         };
-        Ok(Self { path, by_user })
+        Ok(Self {
+            path,
+            spaces,
+            logins,
+        })
     }
 
     pub fn get(&self, user_id: i64) -> Option<&str> {
-        self.by_user.get(&user_id).map(String::as_str)
+        self.spaces.get(&user_id).map(String::as_str)
+    }
+
+    pub fn login(&self, user_id: i64) -> Option<&str> {
+        self.logins.get(&user_id).map(String::as_str)
     }
 
     pub fn set(&mut self, user_id: i64, name: &str) -> Result<String> {
-        let name = normalize_space_name(name)?;
-        self.by_user.insert(user_id, name.clone());
+        let name = normalize_name("folder", name)?;
+        self.spaces.insert(user_id, name.clone());
+        self.save()?;
+        Ok(name)
+    }
+
+    pub fn set_login(&mut self, user_id: i64, name: &str) -> Result<String> {
+        let name = normalize_name("login", name)?;
+        self.logins.insert(user_id, name.clone());
         self.save()?;
         Ok(name)
     }
@@ -45,12 +65,9 @@ impl SpaceBindings {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let file = SpaceFile {
-            spaces: self
-                .by_user
-                .iter()
-                .map(|(id, name)| (id.to_string(), name.clone()))
-                .collect(),
+        let file = BindingsFile {
+            spaces: stringify_map(&self.spaces),
+            logins: stringify_map(&self.logins),
         };
         fs::write(&self.path, serde_json::to_string_pretty(&file)?)?;
         Ok(())
@@ -58,24 +75,41 @@ impl SpaceBindings {
 }
 
 pub fn normalize_space_name(name: &str) -> Result<String> {
+    normalize_name("folder", name)
+}
+
+fn normalize_name(kind: &str, name: &str) -> Result<String> {
     let name = name.trim();
-    anyhow::ensure!(!name.is_empty(), "space name is required");
-    anyhow::ensure!(name.len() <= MAX_SPACE_NAME, "space name is too long");
-    anyhow::ensure!(!name.starts_with('/'), "space name cannot start with /");
+    anyhow::ensure!(!name.is_empty(), "{kind} is required");
+    anyhow::ensure!(name.len() <= MAX_NAME, "{kind} is too long");
+    anyhow::ensure!(!name.starts_with('/'), "{kind} cannot start with /");
     Ok(name.to_owned())
 }
 
-fn parse_space_file(text: &str) -> Result<HashMap<i64, String>> {
-    let file: SpaceFile = serde_json::from_str(text)?;
+fn stringify_map(map: &HashMap<i64, String>) -> HashMap<String, String> {
+    map.iter()
+        .map(|(id, name)| (id.to_string(), name.clone()))
+        .collect()
+}
+
+fn parse_id_map(raw: HashMap<String, String>, kind: &str) -> HashMap<i64, String> {
     let mut by_user = HashMap::new();
-    for (key, name) in file.spaces {
+    for (key, name) in raw {
         if let Ok(id) = key.parse::<i64>()
-            && let Ok(name) = normalize_space_name(&name)
+            && let Ok(name) = normalize_name(kind, &name)
         {
             by_user.insert(id, name);
         }
     }
-    Ok(by_user)
+    by_user
+}
+
+fn parse_bindings_file(text: &str) -> Result<(HashMap<i64, String>, HashMap<i64, String>)> {
+    let file: BindingsFile = serde_json::from_str(text)?;
+    Ok((
+        parse_id_map(file.spaces, "folder"),
+        parse_id_map(file.logins, "login"),
+    ))
 }
 
 pub fn spaces_path(state_dir: &Path) -> PathBuf {
@@ -94,16 +128,27 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_per_user_space() {
+    fn round_trips_per_user_space_and_login() {
         let directory =
             std::env::temp_dir().join(format!("scratchwall-spaces-{}", std::process::id()));
         let path = directory.join("spaces.json");
         let _ = fs::remove_dir_all(&directory);
         let mut bindings = SpaceBindings::load(&path).unwrap();
         assert!(bindings.get(42).is_none());
+        assert!(bindings.login(42).is_none());
         bindings.set(42, "  Dump  ").unwrap();
+        bindings.set_login(42, "  Svyat  ").unwrap();
         let reloaded = SpaceBindings::load(&path).unwrap();
         assert_eq!(reloaded.get(42), Some("Dump"));
+        assert_eq!(reloaded.login(42), Some("Svyat"));
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn loads_legacy_spaces_file_without_logins() {
+        let text = r#"{"spaces":{"7":"Memes"}}"#;
+        let (spaces, logins) = parse_bindings_file(text).unwrap();
+        assert_eq!(spaces.get(&7).map(String::as_str), Some("Memes"));
+        assert!(logins.is_empty());
     }
 }

@@ -13,7 +13,7 @@ use std::{
     collections::HashSet,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use telegram::{HandleError, Telegram, post_ingest};
+use telegram::{HandleError, Telegram, post_ingest, request_telegram_bind};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -46,7 +46,6 @@ async fn main() -> Result<()> {
             }
         };
         let seen: Vec<i64> = updates.iter().map(|update| update.update_id).collect();
-        let mut transient = false;
         for update in &updates {
             if processed.contains(&update.update_id) {
                 continue;
@@ -60,51 +59,33 @@ async fn main() -> Result<()> {
                     user_id,
                     command,
                 } => {
-                    handle_command(&telegram, &mut spaces, chat_id, user_id, command).await?;
+                    handle_command(
+                        &config,
+                        &telegram,
+                        &http,
+                        &mut spaces,
+                        chat_id,
+                        user_id,
+                        command,
+                    )
+                    .await?;
                     processed.insert(update.update_id);
                 }
                 Classified::Item(item) => {
                     if let Some(ready) = albums.push(item, unix_ms()) {
-                        match handle_item(&config, &telegram, &http, &spaces, ready).await {
-                            Ok(()) => {
-                                processed.insert(update.update_id);
-                            }
-                            Err(error) if error.is_transient() => {
-                                tracing::warn!(error = %error, "transient ingest failure");
-                                transient = true;
-                                break;
-                            }
-                            Err(error) => {
-                                tracing::error!(error = %error, "ingest failed");
-                                processed.insert(update.update_id);
-                            }
-                        }
+                        handle_item(&config, &telegram, &http, &spaces, ready).await?;
+                        processed.insert(update.update_id);
                     }
                 }
             }
         }
-        if !transient {
-            for item in albums.take_ready(unix_ms(), ALBUM_GRACE_MS) {
-                let ids = item.update_ids.clone();
-                let chat_id = item.chat_id;
-                match handle_item(&config, &telegram, &http, &spaces, item).await {
-                    Ok(()) => processed.extend(ids),
-                    Err(error) if error.is_transient() => {
-                        tracing::warn!(error = %error, chat_id, "transient album ingest failure");
-                        transient = true;
-                        break;
-                    }
-                    Err(error) => {
-                        tracing::error!(error = %error, chat_id, "album ingest failed");
-                        processed.extend(ids);
-                    }
-                }
-            }
+        for item in albums.take_ready(unix_ms(), ALBUM_GRACE_MS) {
+            let ids = item.update_ids.clone();
+            handle_item(&config, &telegram, &http, &spaces, item).await?;
+            processed.extend(ids);
         }
-        if !transient {
-            offset_value = offset::next_offset(offset_value, &processed, &seen);
-            offset::save(&config.offset_path(), offset_value)?;
-        }
+        offset_value = offset::next_offset(offset_value, &processed, &seen);
+        offset::save(&config.offset_path(), offset_value)?;
         processed.retain(|id| *id >= offset_value.saturating_sub(1));
     }
 }
@@ -126,27 +107,91 @@ fn unix_ms() -> u64 {
 }
 
 async fn handle_command(
+    config: &Config,
     telegram: &Telegram,
+    http: &reqwest::Client,
     spaces: &mut spaces::SpaceBindings,
     chat_id: i64,
     user_id: i64,
     command: Command,
 ) -> Result<(), HandleError> {
-    let text = match command {
-        Command::Start => "Pick a Scratchwall folder with /space Name, then forward memes here.\n\
-             If that folder does not exist yet, it is created on the first save."
-            .to_owned(),
-        Command::Space { name: None } => match spaces.get(user_id) {
-            Some(space) => format!("Saving to {space}. Change it with /space Name."),
-            None => "No folder yet. Set one with /space Name.".into(),
+    match command {
+        Command::Start => {
+            telegram
+                .send_message(
+                    chat_id,
+                    "\
+Connect Scratchwall, then pick a folder, then forward memes.\n\
+/login — connect your Scratchwall account\n\
+/space Name — folder; created on first save if missing.",
+                )
+                .await
+        }
+        Command::Login { name: _ } => send_login(config, telegram, http, chat_id, user_id).await,
+        Command::Space { name: None } => {
+            let text = match spaces.get(user_id) {
+                Some(space) => format!("Saving to {space}. Change it with /space Name."),
+                None => "No folder yet. Set one with /space Name.".into(),
+            };
+            telegram.send_message(chat_id, &text).await
+        }
+        Command::Space { name: Some(name) } => {
+            let text = match spaces.set(user_id, &name) {
+                Ok(space) => format!("Saving to {space}. Forward a meme whenever."),
+                Err(error) => error.to_string(),
+            };
+            telegram.send_message(chat_id, &text).await
+        }
+        Command::Unknown(name) => {
+            telegram
+                .send_message(
+                    chat_id,
+                    &format!("Unknown command {name}. Try /login and /space Name."),
+                )
+                .await
+        }
+    }
+}
+
+async fn send_login(
+    config: &Config,
+    telegram: &Telegram,
+    http: &reqwest::Client,
+    chat_id: i64,
+    user_id: i64,
+) -> Result<(), HandleError> {
+    match request_telegram_bind(
+        http,
+        &config.scratchwall_url,
+        &config.scratchwall_ingest_token,
+        user_id,
+    )
+    .await
+    {
+        Ok(status) => match status.url {
+            Some(url) => {
+                telegram
+                    .send_connect(
+                        chat_id,
+                        "Connect Scratchwall to choose who you save as.",
+                        &url,
+                    )
+                    .await
+            }
+            None => {
+                let name = status.display_name.unwrap_or_else(|| "your account".into());
+                telegram
+                    .send_message(chat_id, &format!("Saving as {name}."))
+                    .await
+            }
         },
-        Command::Space { name: Some(name) } => match spaces.set(user_id, &name) {
-            Ok(space) => format!("Saving to {space}. Forward a meme whenever."),
-            Err(error) => error.to_string(),
-        },
-        Command::Unknown(name) => format!("Unknown command {name}. Try /space Name."),
-    };
-    telegram.send_message(chat_id, &text).await
+        Err(error) => {
+            tracing::warn!(error = %error, "telegram bind request failed");
+            telegram
+                .send_message(chat_id, &ingest_user_message(&error))
+                .await
+        }
+    }
 }
 
 async fn handle_item(
@@ -169,28 +214,53 @@ async fn handle_item(
     }
     let mut files = Vec::new();
     for file in &item.files {
-        let bytes = telegram.download(&file.file_id).await?;
-        files.push((file.filename.clone(), file.mime_type.clone(), bytes));
+        match telegram.download(&file.file_id).await {
+            Ok(bytes) => files.push((file.filename.clone(), file.mime_type.clone(), bytes)),
+            Err(error) => {
+                tracing::warn!(error = %error, "telegram download failed");
+                telegram
+                    .send_message(
+                        item.chat_id,
+                        "Could not download that file from Telegram. Forward it again.",
+                    )
+                    .await?;
+                return Ok(());
+            }
+        }
     }
     match post_ingest(
         http,
         &config.scratchwall_url,
         &config.scratchwall_ingest_token,
+        item.user_id,
         &space,
         &item,
         files,
     )
     .await
     {
-        Ok(()) => {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if error
+                .message()
+                .contains("telegram account is not connected")
+            {
+                return send_login(config, telegram, http, item.chat_id, item.user_id).await;
+            }
+            tracing::warn!(error = %error, telegram_user_id = item.user_id, space, "ingest failed");
             telegram
-                .send_message(item.chat_id, &format!("saved to {space}"))
+                .send_message(item.chat_id, &ingest_user_message(&error))
                 .await?;
             Ok(())
         }
-        Err(error) => {
-            let _ = telegram.send_message(item.chat_id, error.message()).await;
-            Err(error)
-        }
+    }
+}
+
+fn ingest_user_message(error: &HandleError) -> String {
+    let text = error.message();
+    if text.contains("502") || text.contains("503") || text.contains("504") {
+        "Scratchwall is unreachable. Forward the meme again.".into()
+    } else {
+        text.to_owned()
     }
 }

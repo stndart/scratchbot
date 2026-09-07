@@ -72,6 +72,7 @@ pub struct IncomingItem {
 pub enum Command {
     Start,
     Space { name: Option<String> },
+    Login { name: Option<String> },
     Unknown(String),
 }
 
@@ -115,6 +116,12 @@ pub fn parse_command(text: &str) -> Option<Command> {
         "/space" => {
             let name = rest.trim();
             Some(Command::Space {
+                name: (!name.is_empty()).then(|| name.to_owned()),
+            })
+        }
+        "/login" => {
+            let name = rest.trim();
+            Some(Command::Login {
                 name: (!name.is_empty()).then(|| name.to_owned()),
             })
         }
@@ -284,6 +291,13 @@ mod tests {
         );
         assert_eq!(parse_command("/start"), Some(Command::Start));
         assert_eq!(parse_command("/space"), Some(Command::Space { name: None }));
+        assert_eq!(
+            parse_command("/login Svyat"),
+            Some(Command::Login {
+                name: Some("Svyat".into())
+            })
+        );
+        assert_eq!(parse_command("/login"), Some(Command::Login { name: None }));
     }
 
     #[test]
