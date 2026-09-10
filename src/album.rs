@@ -60,11 +60,13 @@ pub fn merge_album(mut items: Vec<IncomingItem>) -> IncomingItem {
         .cloned()
         .expect("album merge requires at least one item");
     merged.update_ids.clear();
+    merged.message_ids.clear();
     merged.files.clear();
     merged.body.clear();
     merged.too_large = None;
     for item in items {
         merged.update_ids.extend(item.update_ids);
+        merged.message_ids.extend(item.message_ids);
         if merged.body.is_empty() {
             merged.body = item.body;
         }
@@ -88,6 +90,7 @@ mod tests {
             chat_id: 42,
             user_id: 42,
             message_id,
+            message_ids: vec![message_id],
             media_group_id: Some("album-1".into()),
             body: caption.into(),
             files: vec![IncomingFile {
@@ -122,6 +125,7 @@ mod tests {
         );
         assert_eq!(album.idempotency_key(), "tg:42:album:album-1");
         assert_eq!(album.update_ids, vec![1001, 1002, 1003]);
+        assert_eq!(album.message_ids, vec![1, 2, 3]);
     }
 
     #[test]

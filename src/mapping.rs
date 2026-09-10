@@ -62,6 +62,7 @@ pub struct IncomingItem {
     pub chat_id: i64,
     pub user_id: i64,
     pub message_id: i64,
+    pub message_ids: Vec<i64>,
     pub media_group_id: Option<String>,
     pub body: String,
     pub files: Vec<IncomingFile>,
@@ -73,6 +74,7 @@ pub enum Command {
     Start,
     Space { name: Option<String> },
     Login { name: Option<String> },
+    Clear,
     Unknown(String),
 }
 
@@ -113,6 +115,7 @@ pub fn parse_command(text: &str) -> Option<Command> {
         .to_ascii_lowercase();
     match cmd.as_str() {
         "/start" | "/help" => Some(Command::Start),
+        "/clear" => Some(Command::Clear),
         "/space" => {
             let name = rest.trim();
             Some(Command::Space {
@@ -222,6 +225,7 @@ pub fn classify(update: &Update, allow: &[i64]) -> Classified {
         chat_id: message.chat.id,
         user_id: from_id,
         message_id: message.message_id,
+        message_ids: vec![message.message_id],
         media_group_id: message.media_group_id.clone(),
         body,
         files,
@@ -290,6 +294,8 @@ mod tests {
             }
         );
         assert_eq!(parse_command("/start"), Some(Command::Start));
+        assert_eq!(parse_command("/clear"), Some(Command::Clear));
+        assert_eq!(parse_command("/clear@ScratchwallBot"), Some(Command::Clear));
         assert_eq!(parse_command("/space"), Some(Command::Space { name: None }));
         assert_eq!(
             parse_command("/login Svyat"),
@@ -298,6 +304,25 @@ mod tests {
             })
         );
         assert_eq!(parse_command("/login"), Some(Command::Login { name: None }));
+        let clear = parse(
+            r#"{
+                "update_id": 104,
+                "message": {
+                    "message_id": 9,
+                    "from": {"id": 42, "is_bot": false, "first_name": "S"},
+                    "chat": {"id": 42, "type": "private"},
+                    "text": "/clear"
+                }
+            }"#,
+        );
+        assert_eq!(
+            classify(&clear, &[]),
+            Classified::Command {
+                chat_id: 42,
+                user_id: 42,
+                command: Command::Clear
+            }
+        );
     }
 
     #[test]
@@ -320,6 +345,7 @@ mod tests {
         let item = item_of(&update, &[42]);
         assert_eq!(item.body, "funny #meme");
         assert_eq!(item.user_id, 42);
+        assert_eq!(item.message_ids, vec![5]);
         assert_eq!(item.idempotency_key(), "tg:42:5");
         assert_eq!(item.files.len(), 1);
         assert_eq!(item.files[0].file_id, "big");

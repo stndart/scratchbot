@@ -151,6 +151,40 @@ impl Telegram {
         }
         Ok(())
     }
+
+    pub async fn delete_message(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+    ) -> Result<DeleteOutcome, HandleError> {
+        let url = format!("https://api.telegram.org/bot{}/deleteMessage", self.token);
+        let response = self
+            .http
+            .post(url)
+            .form(&[
+                ("chat_id", chat_id.to_string()),
+                ("message_id", message_id.to_string()),
+            ])
+            .send()
+            .await
+            .map_err(HandleError::transient)?;
+        let status = response.status();
+        if status.is_server_error() || status.as_u16() == 429 {
+            return Err(HandleError::Transient(format!(
+                "telegram deleteMessage {status}"
+            )));
+        }
+        let payload: ApiResponse<bool> = response.json().await.map_err(HandleError::transient)?;
+        if payload.ok {
+            return Ok(DeleteOutcome::Deleted);
+        }
+        Ok(classify_delete_error(
+            payload
+                .description
+                .as_deref()
+                .unwrap_or("telegram deleteMessage failed"),
+        ))
+    }
 }
 
 fn message_form(
@@ -176,6 +210,25 @@ fn message_form(
         ));
     }
     form
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    Deleted,
+    Gone,
+    Forbidden,
+}
+
+pub fn classify_delete_error(description: &str) -> DeleteOutcome {
+    let description = description.to_ascii_lowercase();
+    if description.contains("not found")
+        || description.contains("message to delete not found")
+        || description.contains("message identifier is not specified")
+    {
+        DeleteOutcome::Gone
+    } else {
+        DeleteOutcome::Forbidden
+    }
 }
 
 #[derive(Debug)]
@@ -318,5 +371,17 @@ mod tests {
         );
         let command = message_form(42, "Saving to memes.", None, None);
         assert!(command.iter().all(|(key, _)| key != "reply_to_message_id"));
+    }
+
+    #[test]
+    fn delete_errors_keep_undeletable_messages_out_of_the_success_path() {
+        assert_eq!(
+            classify_delete_error("Bad Request: message to delete not found"),
+            DeleteOutcome::Gone
+        );
+        assert_eq!(
+            classify_delete_error("Bad Request: message can't be deleted"),
+            DeleteOutcome::Forbidden
+        );
     }
 }

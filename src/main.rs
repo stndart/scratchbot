@@ -7,6 +7,7 @@ use config::Config;
 use scratchwall_telegram::{
     ALBUM_GRACE_MS,
     album::AlbumBuffer,
+    delivered::{self, Delivered},
     mapping::{self, Classified, Command},
     offset, spaces,
 };
@@ -14,7 +15,7 @@ use std::{
     collections::HashSet,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use telegram::{HandleError, Telegram, post_ingest, request_telegram_bind};
+use telegram::{DeleteOutcome, HandleError, Telegram, post_ingest, request_telegram_bind};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -47,6 +48,7 @@ async fn run() -> Result<()> {
         .build()?;
     let mut offset_value = offset::load(&config.offset_path())?;
     let mut spaces = spaces::SpaceBindings::load(spaces::spaces_path(&config.state_dir))?;
+    let mut delivered = Delivered::load(delivered::delivered_path(&config.state_dir))?;
     let mut albums = AlbumBuffer::new();
     let mut processed = HashSet::new();
     tracing::info!(url = %config.scratchwall_url, "telegram ingest bot started");
@@ -81,6 +83,7 @@ async fn run() -> Result<()> {
                         &telegram,
                         &http,
                         &mut spaces,
+                        &mut delivered,
                         chat_id,
                         user_id,
                         command,
@@ -90,7 +93,8 @@ async fn run() -> Result<()> {
                 }
                 Classified::Item(item) => {
                     if let Some(ready) = albums.push(item, unix_ms()) {
-                        handle_item(&config, &telegram, &http, &spaces, ready).await?;
+                        handle_item(&config, &telegram, &http, &spaces, &mut delivered, ready)
+                            .await?;
                         processed.insert(update.update_id);
                     }
                 }
@@ -98,7 +102,7 @@ async fn run() -> Result<()> {
         }
         for item in albums.take_ready(unix_ms(), ALBUM_GRACE_MS) {
             let ids = item.update_ids.clone();
-            handle_item(&config, &telegram, &http, &spaces, item).await?;
+            handle_item(&config, &telegram, &http, &spaces, &mut delivered, item).await?;
             processed.extend(ids);
         }
         offset_value = offset::next_offset(offset_value, &processed, &seen);
@@ -123,11 +127,13 @@ fn unix_ms() -> u64 {
         .as_millis() as u64
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_command(
     config: &Config,
     telegram: &Telegram,
     http: &reqwest::Client,
     spaces: &mut spaces::SpaceBindings,
+    delivered: &mut Delivered,
     chat_id: i64,
     user_id: i64,
     command: Command,
@@ -140,7 +146,8 @@ async fn handle_command(
                     "\
 Connect Scratchwall, then pick a folder, then forward memes.\n\
 /login — connect your Scratchwall account\n\
-/space Name — folder; created on first save if missing.",
+/space Name — folder; created on first save if missing.\n\
+/clear — delete Telegram copies that already reached Scratchwall.",
                 )
                 .await
         }
@@ -159,11 +166,12 @@ Connect Scratchwall, then pick a folder, then forward memes.\n\
             };
             telegram.send_message(chat_id, &text).await
         }
+        Command::Clear => clear_delivered(telegram, delivered, chat_id, user_id).await,
         Command::Unknown(name) => {
             telegram
                 .send_message(
                     chat_id,
-                    &format!("Unknown command {name}. Try /login and /space Name."),
+                    &format!("Unknown command {name}. Try /login, /space Name, and /clear."),
                 )
                 .await
         }
@@ -216,6 +224,7 @@ async fn handle_item(
     telegram: &Telegram,
     http: &reqwest::Client,
     spaces: &spaces::SpaceBindings,
+    delivered: &mut Delivered,
     item: mapping::IncomingItem,
 ) -> Result<(), HandleError> {
     let Some(space) = spaces.get(item.user_id).map(str::to_owned) else {
@@ -263,7 +272,14 @@ async fn handle_item(
     )
     .await
     {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            if let Err(error) =
+                delivered.record(item.user_id, item.chat_id, item.message_ids.iter().copied())
+            {
+                tracing::warn!(error = %error, "could not remember delivered telegram messages");
+            }
+            Ok(())
+        }
         Err(error) => {
             if error
                 .message()
@@ -280,11 +296,95 @@ async fn handle_item(
     }
 }
 
+async fn clear_delivered(
+    telegram: &Telegram,
+    delivered: &mut Delivered,
+    chat_id: i64,
+    user_id: i64,
+) -> Result<(), HandleError> {
+    let pending = delivered.list_for_chat(user_id, chat_id);
+    if pending.is_empty() {
+        return telegram
+            .send_message(
+                chat_id,
+                "Nothing to clear. Only messages that already reached Scratchwall are removed.",
+            )
+            .await;
+    }
+    let mut finished = Vec::new();
+    let mut deleted = 0usize;
+    let mut skipped = 0usize;
+    let mut stopped = false;
+    for message in pending {
+        match telegram
+            .delete_message(message.chat_id, message.message_id)
+            .await
+        {
+            Ok(DeleteOutcome::Deleted | DeleteOutcome::Gone) => {
+                finished.push(message);
+                deleted += 1;
+            }
+            Ok(DeleteOutcome::Forbidden) => {
+                finished.push(message);
+                skipped += 1;
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "telegram deleteMessage failed");
+                stopped = true;
+                break;
+            }
+        }
+    }
+    if let Err(error) = delivered.remove(user_id, &finished) {
+        tracing::warn!(error = %error, "could not update delivered message list");
+    }
+    telegram
+        .send_message(chat_id, &clear_summary(deleted, skipped, stopped))
+        .await
+}
+
+fn clear_summary(deleted: usize, skipped: usize, stopped: bool) -> String {
+    let mut text = if deleted == 0 {
+        "Removed no Telegram messages.".into()
+    } else if deleted == 1 {
+        "Removed 1 Telegram message that was already in Scratchwall.".into()
+    } else {
+        format!("Removed {deleted} Telegram messages that were already in Scratchwall.")
+    };
+    if skipped > 0 {
+        text.push_str(&format!(
+            " Left {skipped} that Telegram would not delete (too old or protected)."
+        ));
+    }
+    if stopped {
+        text.push_str(" Stopped early; remaining successful copies can be cleared next time.");
+    }
+    text.push_str(" Failed or unprocessed forwards were not touched.");
+    text
+}
+
 fn ingest_user_message(error: &HandleError) -> String {
     let text = error.message();
     if text.contains("502") || text.contains("503") || text.contains("504") {
         "Scratchwall is unreachable. Forward the meme again.".into()
     } else {
         text.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clear_summary;
+
+    #[test]
+    fn clear_summary_leaves_failures_and_mentions_skips() {
+        let text = clear_summary(2, 1, false);
+        assert!(text.contains("Removed 2 Telegram messages"));
+        assert!(text.contains("Left 1"));
+        assert!(text.contains("Failed or unprocessed forwards were not touched"));
+        assert!(!text.contains("Stopped early"));
+        let empty = clear_summary(0, 0, true);
+        assert!(empty.contains("Removed no Telegram messages"));
+        assert!(empty.contains("Stopped early"));
     }
 }
