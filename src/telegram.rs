@@ -108,7 +108,17 @@ impl Telegram {
     }
 
     pub async fn send_message(&self, chat_id: i64, text: &str) -> Result<(), HandleError> {
-        self.send_message_markup(chat_id, text, None).await
+        self.send_message_opts(chat_id, text, None, None).await
+    }
+
+    pub async fn reply_message(
+        &self,
+        chat_id: i64,
+        reply_to_message_id: i64,
+        text: &str,
+    ) -> Result<(), HandleError> {
+        self.send_message_opts(chat_id, text, Some(reply_to_message_id), None)
+            .await
     }
 
     pub async fn send_connect(
@@ -117,27 +127,18 @@ impl Telegram {
         text: &str,
         url: &str,
     ) -> Result<(), HandleError> {
-        self.send_message_markup(chat_id, text, Some(url)).await
+        self.send_message_opts(chat_id, text, None, Some(url)).await
     }
 
-    async fn send_message_markup(
+    async fn send_message_opts(
         &self,
         chat_id: i64,
         text: &str,
+        reply_to_message_id: Option<i64>,
         connect_url: Option<&str>,
     ) -> Result<(), HandleError> {
         let url = format!("https://api.telegram.org/bot{}/sendMessage", self.token);
-        let chat_id = chat_id.to_string();
-        let mut form = vec![("chat_id", chat_id), ("text", text.to_owned())];
-        let markup = connect_url.map(|connect| {
-            serde_json::json!({
-                "inline_keyboard": [[{"text": "Connect Scratchwall", "url": connect}]]
-            })
-            .to_string()
-        });
-        if let Some(markup) = markup.as_deref() {
-            form.push(("reply_markup", markup.to_owned()));
-        }
+        let form = message_form(chat_id, text, reply_to_message_id, connect_url);
         let response = self
             .http
             .post(url)
@@ -150,6 +151,31 @@ impl Telegram {
         }
         Ok(())
     }
+}
+
+fn message_form(
+    chat_id: i64,
+    text: &str,
+    reply_to_message_id: Option<i64>,
+    connect_url: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut form = vec![
+        ("chat_id".into(), chat_id.to_string()),
+        ("text".into(), text.to_owned()),
+    ];
+    if let Some(reply_to) = reply_to_message_id {
+        form.push(("reply_to_message_id".into(), reply_to.to_string()));
+    }
+    if let Some(connect) = connect_url {
+        form.push((
+            "reply_markup".into(),
+            serde_json::json!({
+                "inline_keyboard": [[{"text": "Connect Scratchwall", "url": connect}]]
+            })
+            .to_string(),
+        ));
+    }
+    form
 }
 
 #[derive(Debug)]
@@ -272,5 +298,25 @@ impl PipeMessage for HandleError {
             HandleError::Transient(_) => HandleError::Transient(text),
             HandleError::Permanent(_) => HandleError::Permanent(text),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ingest_error_form_replies_to_the_source_message() {
+        let form = message_form(42, "scratchwall ingest 500: boom", Some(99), None);
+        assert_eq!(
+            form,
+            vec![
+                ("chat_id".into(), "42".into()),
+                ("text".into(), "scratchwall ingest 500: boom".into()),
+                ("reply_to_message_id".into(), "99".into()),
+            ]
+        );
+        let command = message_form(42, "Saving to memes.", None, None);
+        assert!(command.iter().all(|(key, _)| key != "reply_to_message_id"));
     }
 }

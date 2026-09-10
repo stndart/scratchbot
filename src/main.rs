@@ -220,13 +220,19 @@ async fn handle_item(
 ) -> Result<(), HandleError> {
     let Some(space) = spaces.get(item.user_id).map(str::to_owned) else {
         telegram
-            .send_message(item.chat_id, "Pick a folder first: /space Name")
+            .reply_message(
+                item.chat_id,
+                item.message_id,
+                "Pick a folder first: /space Name",
+            )
             .await?;
         return Ok(());
     };
     if let Some(name) = &item.too_large {
         let text = format!("{name} is larger than 20 MiB");
-        telegram.send_message(item.chat_id, &text).await?;
+        telegram
+            .reply_message(item.chat_id, item.message_id, &text)
+            .await?;
         return Ok(());
     }
     let mut files = Vec::new();
@@ -236,8 +242,9 @@ async fn handle_item(
             Err(error) => {
                 tracing::warn!(error = %error, "telegram download failed");
                 telegram
-                    .send_message(
+                    .reply_message(
                         item.chat_id,
+                        item.message_id,
                         "Could not download that file from Telegram. Forward it again.",
                     )
                     .await?;
@@ -266,7 +273,7 @@ async fn handle_item(
             }
             tracing::warn!(error = %error, telegram_user_id = item.user_id, space, "ingest failed");
             telegram
-                .send_message(item.chat_id, &ingest_user_message(&error))
+                .reply_message(item.chat_id, item.message_id, &ingest_user_message(&error))
                 .await?;
             Ok(())
         }
