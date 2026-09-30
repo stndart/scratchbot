@@ -8,6 +8,23 @@ pub struct Config {
     pub scratchwall_url: String,
     pub scratchwall_ingest_token: String,
     pub state_dir: PathBuf,
+    pub update: Option<UpdateConfig>,
+}
+
+#[derive(Clone)]
+pub struct UpdateConfig {
+    pub listen: String,
+    pub token: String,
+}
+
+impl std::fmt::Debug for UpdateConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UpdateConfig")
+            .field("listen", &self.listen)
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 impl Config {
@@ -36,6 +53,18 @@ impl Config {
             !scratchwall_ingest_token.is_empty(),
             "INGEST_TOKEN or SCRATCHWALL_INGEST_TOKEN is required"
         );
+        let update_token = std::env::var("UPDATE_TOKEN")
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        let update = if update_token.is_empty() {
+            None
+        } else {
+            Some(UpdateConfig {
+                listen: std::env::var("UPDATE_LISTEN").unwrap_or_else(|_| "127.0.0.1:8765".into()),
+                token: update_token,
+            })
+        };
         Ok(Self {
             telegram_bot_token: std::env::var("TELEGRAM_BOT_TOKEN")
                 .context("TELEGRAM_BOT_TOKEN is required")?,
@@ -49,6 +78,7 @@ impl Config {
                     "./data".into()
                 }
             })),
+            update,
         })
     }
 

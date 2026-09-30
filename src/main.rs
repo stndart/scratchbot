@@ -1,6 +1,7 @@
 mod config;
 mod service;
 mod telegram;
+mod update;
 
 use anyhow::Result;
 use config::Config;
@@ -25,6 +26,10 @@ async fn main() -> Result<()> {
         [] => run().await,
         [flag] if flag == "--install" => service::install(),
         [flag] if flag == "--uninstall" => service::uninstall(),
+        [flag] if flag == "--ready" => {
+            println!("ok");
+            Ok(())
+        }
         [flag] if flag == "--help" || flag == "-h" => {
             service::print_help();
             Ok(())
@@ -53,12 +58,45 @@ async fn run() -> Result<()> {
     let mut delivered = Delivered::load(delivered::delivered_path(&config.state_dir))?;
     let mut albums = AlbumBuffer::new();
     let mut processed = HashSet::new();
-    tracing::info!(url = %config.scratchwall_url, "telegram ingest bot started");
+    let self_update = if let Some(update) = config.update.clone() {
+        Some(update::serve(update).await?)
+    } else {
+        tracing::info!("self-update hook disabled");
+        None
+    };
+    match update::exe_sha256() {
+        Ok(sha256) => tracing::info!(
+            url = %config.scratchwall_url,
+            sha256 = %sha256,
+            build = update::build_sha(),
+            "telegram ingest bot started"
+        ),
+        Err(error) => tracing::info!(
+            url = %config.scratchwall_url,
+            error = %error,
+            build = update::build_sha(),
+            "telegram ingest bot started"
+        ),
+    }
 
     loop {
         let now = unix_ms();
         let timeout = poll_timeout(&albums, now);
-        let updates = match telegram.get_updates(offset_value, timeout).await {
+        let updates = if let Some(gate) = &self_update {
+            tokio::select! {
+                biased;
+                _ = gate.notified() => {
+                    if let Err(error) = gate.restart_if_staged() {
+                        tracing::error!(error = %error, "self-update failed");
+                    }
+                    continue;
+                }
+                result = telegram.get_updates(offset_value, timeout) => result,
+            }
+        } else {
+            telegram.get_updates(offset_value, timeout).await
+        };
+        let updates = match updates {
             Ok(updates) => updates,
             Err(error) => {
                 tracing::warn!(error = %error, "getUpdates failed");
