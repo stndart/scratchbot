@@ -1,0 +1,57 @@
+name: deploy
+
+on:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          docker build --build-arg GIT_SHA="${GITHUB_SHA}" -t scratchwall-telegram:release .
+          id=$(docker create scratchwall-telegram:release)
+          docker cp "$id":/artifacts/scratchwall-telegram ./scratchwall-telegram
+          docker rm "$id"
+
+      - name: Publish release and notify the bot
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # DEPLOY_HOOK_URL is the bot's public update endpoint.
+          # DEPLOY_HOOK_TOKEN matches UPDATE_TOKEN on the host.
+          DEPLOY_HOOK_URL: ${{ secrets.DEPLOY_HOOK_URL }}
+          DEPLOY_HOOK_TOKEN: ${{ secrets.DEPLOY_HOOK_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_HOOK_URL"
+          test -n "$DEPLOY_HOOK_TOKEN"
+          sha=$(sha256sum scratchwall-telegram | awk '{print $1}')
+          tag="deploy-${GITHUB_SHA}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release delete "$tag" --yes --cleanup-tag
+          fi
+          notes=$(printf 'Automatic deploy of %s.\n\nsha256: %s\n' "$GITHUB_SHA" "$sha")
+          gh release create "$tag" \
+            --title "deploy ${GITHUB_SHA::12}" \
+            --notes "$notes" \
+            scratchwall-telegram
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/scratchwall-telegram"
+          payload=$(jq -n \
+            --arg url "$url" \
+            --arg sha256 "$sha" \
+            --arg version "$GITHUB_SHA" \
+            '{url:$url, sha256:$sha256, version:$version}')
+          curl --fail-with-body --silent --show-error --max-time 30 \
+            -X POST "$DEPLOY_HOOK_URL" \
+            -H "Authorization: Bearer ${DEPLOY_HOOK_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "$payload"
+          echo

@@ -75,6 +75,7 @@ pub enum Command {
     Space { name: Option<String> },
     Login { name: Option<String> },
     Clear,
+    ShowSent,
     Unknown(String),
 }
 
@@ -116,6 +117,7 @@ pub fn parse_command(text: &str) -> Option<Command> {
     match cmd.as_str() {
         "/start" | "/help" => Some(Command::Start),
         "/clear" => Some(Command::Clear),
+        "/show-sent" => Some(Command::ShowSent),
         "/space" => {
             let name = rest.trim();
             Some(Command::Space {
@@ -296,6 +298,11 @@ mod tests {
         assert_eq!(parse_command("/start"), Some(Command::Start));
         assert_eq!(parse_command("/clear"), Some(Command::Clear));
         assert_eq!(parse_command("/clear@ScratchwallBot"), Some(Command::Clear));
+        assert_eq!(parse_command("/show-sent"), Some(Command::ShowSent));
+        assert_eq!(
+            parse_command("/show-sent@ScratchwallBot"),
+            Some(Command::ShowSent)
+        );
         assert_eq!(parse_command("/space"), Some(Command::Space { name: None }));
         assert_eq!(
             parse_command("/login Svyat"),

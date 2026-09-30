@@ -1,6 +1,7 @@
 use anyhow::Result;
 
-const BIN_PATH: &str = "/usr/local/bin/scratchwall-telegram";
+const BIN_PATH: &str = "/var/lib/scratchwall-telegram/bin/scratchwall-telegram";
+const LEGACY_BIN_PATH: &str = "/usr/local/bin/scratchwall-telegram";
 const UNIT_PATH: &str = "/etc/systemd/system/scratchwall-telegram.service";
 const ENV_PATH: &str = "/etc/scratchwall/telegram.env";
 const STATE_DIR: &str = "/var/lib/scratchwall-telegram";
@@ -8,18 +9,22 @@ const STATE_DIR: &str = "/var/lib/scratchwall-telegram";
 pub fn print_help() {
     eprintln!(
         "\
-scratchwall-telegram [--install | --uninstall | --help]
+scratchwall-telegram [--install | --uninstall | --ready | --help]
 
   (no args)     run the ingest bot
   --install     copy this binary and enable a systemd service (Linux, root)
   --uninstall   stop the service and remove the unit and installed binary
+  --ready       exit 0 if this binary can start
   --help        show this text
 
 Install paths:
   {BIN_PATH}
   {UNIT_PATH}
   {ENV_PATH}
-  {STATE_DIR}"
+  {STATE_DIR}
+
+The binary lives in the service state directory so the service user can
+replace it when a deploy hook arrives. Set UPDATE_TOKEN to enable that hook."
     );
 }
 
@@ -63,7 +68,7 @@ Group=scratchwall-telegram
 WorkingDirectory=/var/lib/scratchwall-telegram
 StateDirectory=scratchwall-telegram
 EnvironmentFile=/etc/scratchwall/telegram.env
-ExecStart=/usr/local/bin/scratchwall-telegram
+ExecStart=/var/lib/scratchwall-telegram/bin/scratchwall-telegram
 Restart=on-failure
 RestartSec=5
 
@@ -77,6 +82,8 @@ SCRATCHWALL_URL=https://scratch.morad.uk
 SCRATCHWALL_INGEST_TOKEN=
 STATE_DIR=/var/lib/scratchwall-telegram
 RUST_LOG=scratchwall_telegram=info
+UPDATE_LISTEN=127.0.0.1:8765
+UPDATE_TOKEN=
 ";
 
     pub fn install() -> Result<()> {
@@ -93,6 +100,7 @@ RUST_LOG=scratchwall_telegram=info
         chmod(UNIT_PATH, 0o644)?;
         systemctl(&["daemon-reload"])?;
         systemctl(&["enable", SERVICE_NAME])?;
+        remove_if_exists(LEGACY_BIN_PATH)?;
         println!("installed {SERVICE_NAME}");
         println!("  binary  {BIN_PATH}");
         println!("  unit    {UNIT_PATH}");
@@ -115,6 +123,7 @@ RUST_LOG=scratchwall_telegram=info
         remove_if_exists(UNIT_PATH)?;
         systemctl_ok(&["daemon-reload"]);
         remove_if_exists(BIN_PATH)?;
+        remove_if_exists(LEGACY_BIN_PATH)?;
         println!("removed {SERVICE_NAME} unit and {BIN_PATH}");
         println!("left {ENV_PATH} and {STATE_DIR} in place");
         Ok(())
