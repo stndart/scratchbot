@@ -108,7 +108,7 @@ impl Telegram {
     }
 
     pub async fn send_message(&self, chat_id: i64, text: &str) -> Result<(), HandleError> {
-        self.send_message_opts(chat_id, text, None, None).await
+        self.send_message_quietly(chat_id, text, None, None).await
     }
 
     pub async fn reply_message(
@@ -117,8 +117,23 @@ impl Telegram {
         reply_to_message_id: i64,
         text: &str,
     ) -> Result<(), HandleError> {
-        self.send_message_opts(chat_id, text, Some(reply_to_message_id), None)
+        self.send_message_quietly(chat_id, text, Some(reply_to_message_id), None)
             .await
+    }
+
+    pub async fn quote_message(
+        &self,
+        chat_id: i64,
+        reply_to_message_id: i64,
+        text: &str,
+    ) -> Result<(), HandleError> {
+        match self
+            .send_message_opts(chat_id, text, Some(reply_to_message_id), None)
+            .await?
+        {
+            SendOutcome::Sent => Ok(()),
+            SendOutcome::Rejected(description) => Err(HandleError::Permanent(description)),
+        }
     }
 
     pub async fn send_connect(
@@ -127,7 +142,40 @@ impl Telegram {
         text: &str,
         url: &str,
     ) -> Result<(), HandleError> {
-        self.send_message_opts(chat_id, text, None, Some(url)).await
+        self.send_message_quietly(chat_id, text, None, Some(url))
+            .await
+    }
+
+    pub async fn send_typing(&self, chat_id: i64) {
+        let url = format!("https://api.telegram.org/bot{}/sendChatAction", self.token);
+        let _ = self
+            .http
+            .post(url)
+            .form(&[
+                ("chat_id", chat_id.to_string()),
+                ("action", "typing".into()),
+            ])
+            .send()
+            .await;
+    }
+
+    async fn send_message_quietly(
+        &self,
+        chat_id: i64,
+        text: &str,
+        reply_to_message_id: Option<i64>,
+        connect_url: Option<&str>,
+    ) -> Result<(), HandleError> {
+        match self
+            .send_message_opts(chat_id, text, reply_to_message_id, connect_url)
+            .await?
+        {
+            SendOutcome::Sent => Ok(()),
+            SendOutcome::Rejected(description) => {
+                tracing::warn!(description, "telegram sendMessage failed");
+                Ok(())
+            }
+        }
     }
 
     async fn send_message_opts(
@@ -136,7 +184,7 @@ impl Telegram {
         text: &str,
         reply_to_message_id: Option<i64>,
         connect_url: Option<&str>,
-    ) -> Result<(), HandleError> {
+    ) -> Result<SendOutcome, HandleError> {
         let url = format!("https://api.telegram.org/bot{}/sendMessage", self.token);
         let form = message_form(chat_id, text, reply_to_message_id, connect_url);
         let response = self
@@ -146,10 +194,70 @@ impl Telegram {
             .send()
             .await
             .map_err(HandleError::transient)?;
-        if !response.status().is_success() {
-            tracing::warn!(status = %response.status(), "telegram sendMessage failed");
+        let status = response.status();
+        if status.is_server_error() || status.as_u16() == 429 {
+            return Err(HandleError::Transient(format!(
+                "telegram sendMessage {status}"
+            )));
         }
-        Ok(())
+        let payload: ApiResponse<serde_json::Value> = match response.json().await {
+            Ok(payload) => payload,
+            Err(_) => {
+                return Ok(SendOutcome::Rejected(format!(
+                    "telegram sendMessage {status}"
+                )));
+            }
+        };
+        if payload.ok {
+            return Ok(SendOutcome::Sent);
+        }
+        Ok(SendOutcome::Rejected(payload.description.unwrap_or_else(
+            || format!("telegram sendMessage {status}"),
+        )))
+    }
+
+    /// Asks Telegram whether this message is still in the chat.
+    /// Editing a user's message is refused when it exists, and reported missing when it was deleted.
+    pub async fn probe_message(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+    ) -> Result<MessagePresence, HandleError> {
+        let url = format!(
+            "https://api.telegram.org/bot{}/editMessageReplyMarkup",
+            self.token
+        );
+        let response = self
+            .http
+            .post(url)
+            .json(&serde_json::json!({
+                "chat_id": chat_id,
+                "message_id": message_id,
+            }))
+            .send()
+            .await
+            .map_err(HandleError::transient)?;
+        let status = response.status();
+        if status.is_server_error() || status.as_u16() == 429 {
+            return Err(HandleError::Transient(format!(
+                "telegram editMessageReplyMarkup {status}"
+            )));
+        }
+        let payload: ApiResponse<serde_json::Value> = match response.json().await {
+            Ok(payload) => payload,
+            Err(_) => {
+                return Err(HandleError::Permanent(format!(
+                    "telegram editMessageReplyMarkup {status}"
+                )));
+            }
+        };
+        if payload.ok {
+            return Ok(MessagePresence::Present);
+        }
+        let description = payload
+            .description
+            .unwrap_or_else(|| "telegram editMessageReplyMarkup failed".into());
+        classify_edit_probe(&description).ok_or(HandleError::Permanent(description))
     }
 
     pub async fn delete_message(
@@ -212,11 +320,37 @@ fn message_form(
     form
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SendOutcome {
+    Sent,
+    Rejected(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessagePresence {
+    Present,
+    Gone,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteOutcome {
     Deleted,
     Gone,
     Forbidden,
+}
+
+pub fn classify_edit_probe(description: &str) -> Option<MessagePresence> {
+    let description = description.to_ascii_lowercase();
+    if description.contains("message_id_invalid")
+        || description.contains("message to edit not found")
+        || description.contains("message not found")
+    {
+        Some(MessagePresence::Gone)
+    } else if description.contains("can't be edited") || description.contains("not modified") {
+        Some(MessagePresence::Present)
+    } else {
+        None
+    }
 }
 
 pub fn classify_delete_error(description: &str) -> DeleteOutcome {
@@ -371,6 +505,31 @@ mod tests {
         );
         let command = message_form(42, "Saving to memes.", None, None);
         assert!(command.iter().all(|(key, _)| key != "reply_to_message_id"));
+    }
+
+    #[test]
+    fn edit_probe_treats_a_refused_edit_as_still_present() {
+        assert_eq!(
+            classify_edit_probe("Bad Request: message can't be edited"),
+            Some(MessagePresence::Present)
+        );
+        assert_eq!(
+            classify_edit_probe("Bad Request: message is not modified"),
+            Some(MessagePresence::Present)
+        );
+        assert_eq!(
+            classify_edit_probe("Bad Request: message to edit not found"),
+            Some(MessagePresence::Gone)
+        );
+        assert_eq!(
+            classify_edit_probe("Bad Request: MESSAGE_ID_INVALID"),
+            Some(MessagePresence::Gone)
+        );
+        assert_eq!(
+            classify_edit_probe("Bad Request: message not found"),
+            Some(MessagePresence::Gone)
+        );
+        assert_eq!(classify_edit_probe("Bad Request: chat not found"), None);
     }
 
     #[test]
