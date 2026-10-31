@@ -1,5 +1,5 @@
 use crate::TELEGRAM_MAX_FILE_BYTES;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Update {
@@ -51,7 +51,7 @@ pub struct FilePayload {
     pub file_size: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IncomingFile {
     pub file_id: String,
     pub filename: String,
@@ -59,8 +59,10 @@ pub struct IncomingFile {
     pub size: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IncomingItem {
+    #[serde(default)]
+    pub ingest_key: Option<String>,
     pub update_ids: Vec<i64>,
     pub chat_id: i64,
     pub user_id: i64,
@@ -103,6 +105,9 @@ pub enum Classified {
 
 impl IncomingItem {
     pub fn idempotency_key(&self) -> String {
+        if let Some(key) = &self.ingest_key {
+            return key.clone();
+        }
         match &self.media_group_id {
             Some(group) => format!("tg:{}:album:{group}", self.chat_id),
             None => format!("tg:{}:{}", self.chat_id, self.message_id),
@@ -257,6 +262,7 @@ pub fn classify(update: &Update, allow: &[i64]) -> Classified {
         return Classified::Ignored;
     }
     Classified::Item(IncomingItem {
+        ingest_key: None,
         update_ids: vec![update.update_id],
         chat_id: message.chat.id,
         user_id: from_id,

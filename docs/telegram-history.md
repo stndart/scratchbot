@@ -39,3 +39,10 @@ not expose the latter. All presence decisions refer to the bot's history.
 Cleanup commands wait for pending albums, and history queries stop at the command
 message ID. Repeated getUpdates results do not extend an album's grace period.
 Unsupported user media is recorded as a failure instead of being silently skipped.
+
+Album upload batches are reserved in SQLite before upload, with immutable source
+metadata and a stable idempotency key per batch. Late members get a new batch;
+a replay reconstructs the entire reserved batch even if Telegram initially
+redelivers only one member. Completed members, including cleared ones, are not
+uploaded again. Late album batches may appear as separate Scratchwall memos.
+This avoids a partial album's idempotency key suppressing later photos.

@@ -1,10 +1,12 @@
 use crate::mapping::IncomingItem;
 use std::collections::HashMap;
 
+type GroupKey = (i64, i64, String);
+
 #[derive(Default)]
 pub struct AlbumBuffer {
-    groups: HashMap<String, HashMap<i64, IncomingItem>>,
-    last_seen_ms: HashMap<String, u64>,
+    groups: HashMap<GroupKey, HashMap<i64, IncomingItem>>,
+    last_seen_ms: HashMap<GroupKey, u64>,
 }
 
 impl AlbumBuffer {
@@ -16,6 +18,7 @@ impl AlbumBuffer {
         let Some(group) = item.media_group_id.clone() else {
             return Some(item);
         };
+        let group = (item.user_id, item.chat_id, group);
         let messages = self.groups.entry(group.clone()).or_default();
         if let std::collections::hash_map::Entry::Vacant(entry) = messages.entry(item.message_id) {
             entry.insert(item);
@@ -25,7 +28,7 @@ impl AlbumBuffer {
     }
 
     pub fn take_ready(&mut self, now_ms: u64, grace_ms: u64) -> Vec<IncomingItem> {
-        let ready: Vec<String> = self
+        let ready: Vec<GroupKey> = self
             .last_seen_ms
             .iter()
             .filter(|(_, seen)| now_ms.saturating_sub(**seen) >= grace_ms)
@@ -88,6 +91,7 @@ mod tests {
 
     fn item(message_id: i64, caption: &str, file_id: &str) -> IncomingItem {
         IncomingItem {
+            ingest_key: None,
             update_ids: vec![1000 + message_id],
             chat_id: 42,
             user_id: 42,
@@ -129,6 +133,20 @@ mod tests {
         assert_eq!(album.idempotency_key(), "tg:42:album:album-1");
         assert_eq!(album.update_ids, vec![1001, 1002, 1003]);
         assert_eq!(album.message_ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn album_identifiers_are_scoped_to_the_sender_and_chat() {
+        let mut buffer = AlbumBuffer::new();
+        let first = item(1, "one", "a");
+        let mut second = item(1, "two", "b");
+        second.user_id = 7;
+        second.chat_id = 7;
+        buffer.push(first, 0);
+        buffer.push(second, 0);
+        let ready = buffer.take_ready(1500, 1500);
+        assert_eq!(ready.len(), 2);
+        assert!(ready.iter().all(|album| album.files.len() == 1));
     }
 
     #[test]

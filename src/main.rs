@@ -329,6 +329,23 @@ async fn handle_item(
     delivered: &mut Delivered,
     item: mapping::IncomingItem,
 ) -> Result<(), HandleError> {
+    let batches = delivered
+        .prepare_batches(&item)
+        .map_err(HandleError::transient)?;
+    for batch in batches {
+        handle_batch(config, telegram, http, spaces, delivered, batch).await?;
+    }
+    Ok(())
+}
+
+async fn handle_batch(
+    config: &Config,
+    telegram: &Telegram,
+    http: &reqwest::Client,
+    spaces: &spaces::SpaceBindings,
+    delivered: &mut Delivered,
+    item: mapping::IncomingItem,
+) -> Result<(), HandleError> {
     let Some(space) = spaces.get(item.user_id).map(str::to_owned) else {
         remember(delivered, &item, DeliveryStatus::Failed)?;
         telegram
@@ -366,6 +383,7 @@ async fn handle_item(
             }
         }
     }
+    let file_count = files.len();
     match post_ingest(
         http,
         &config.scratchwall_url,
@@ -379,6 +397,7 @@ async fn handle_item(
     {
         Ok(()) => {
             remember(delivered, &item, DeliveryStatus::Sent)?;
+            tracing::info!(chat_id=item.chat_id,message_ids=?item.message_ids,file_count,key=%item.idempotency_key(),"Telegram forward saved");
             Ok(())
         }
         Err(error) => {

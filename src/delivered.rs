@@ -61,7 +61,9 @@ impl Delivered {
                 status TEXT NOT NULL CHECK(status IN ('sent','failed')), date INTEGER,
                 removed INTEGER NOT NULL DEFAULT 0, clear_blocked INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(user_id,chat_id,message_id));
-            CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY);",
+            CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS album_batches (user_id INTEGER NOT NULL,chat_id INTEGER NOT NULL,batch_key TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(user_id,chat_id,batch_key));
+            CREATE TABLE IF NOT EXISTS album_members (user_id INTEGER NOT NULL,chat_id INTEGER NOT NULL,message_id INTEGER NOT NULL,batch_key TEXT NOT NULL,PRIMARY KEY(user_id,chat_id,message_id));",
         )?;
         let migrated: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM migrations WHERE name='legacy-json')",
@@ -95,6 +97,86 @@ impl Delivered {
             tx.commit()?;
         }
         Ok(Self { db })
+    }
+
+    /// Reserve immutable upload batches before any network request. On replay,
+    /// reconstruct the entire original batch, even if only one member reappears.
+    pub fn prepare_batches(
+        &mut self,
+        item: &crate::mapping::IncomingItem,
+    ) -> Result<Vec<crate::mapping::IncomingItem>> {
+        let Some(group) = &item.media_group_id else {
+            return Ok(vec![item.clone()]);
+        };
+        if item.too_large.is_some() {
+            return Ok(vec![item.clone()]);
+        }
+        anyhow::ensure!(
+            item.files.len() == item.message_ids.len()
+                && item.update_ids.len() == item.message_ids.len()
+                && item.message_dates.len() == item.message_ids.len(),
+            "album file/message mapping is incomplete"
+        );
+        let tx = self.db.transaction()?;
+        let mut keys = std::collections::BTreeSet::new();
+        let mut new_indices = Vec::new();
+        for (index, id) in item.message_ids.iter().enumerate() {
+            let key:Option<String>=tx.query_row("SELECT batch_key FROM album_members WHERE user_id=? AND chat_id=? AND message_id=?",params![item.user_id,item.chat_id,id],|r|r.get(0)).optional()?;
+            if let Some(key) = key {
+                keys.insert(key);
+            } else {
+                let sent:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE user_id=? AND chat_id=? AND message_id=? AND status='sent')",params![item.user_id,item.chat_id,id],|r|r.get(0))?;
+                if !sent {
+                    new_indices.push(index);
+                }
+            }
+        }
+        let mut batches = Vec::new();
+        for key in keys {
+            let payload: String = tx.query_row(
+                "SELECT payload FROM album_batches WHERE user_id=? AND chat_id=? AND batch_key=?",
+                params![item.user_id, item.chat_id, key],
+                |r| r.get(0),
+            )?;
+            let batch: crate::mapping::IncomingItem = serde_json::from_str(&payload)?;
+            let mut complete = true;
+            for id in &batch.message_ids {
+                let sent:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE user_id=? AND chat_id=? AND message_id=? AND status='sent')",params![item.user_id,item.chat_id,id],|r|r.get(0))?;
+                complete &= sent;
+            }
+            if !complete {
+                batches.push(batch);
+            }
+        }
+        if !new_indices.is_empty() {
+            let mut batch = item.clone();
+            batch.message_id = item.message_ids[new_indices[0]];
+            batch.message_ids = new_indices.iter().map(|&i| item.message_ids[i]).collect();
+            batch.message_dates = new_indices.iter().map(|&i| item.message_dates[i]).collect();
+            batch.update_ids = new_indices.iter().map(|&i| item.update_ids[i]).collect();
+            batch.files = new_indices.iter().map(|&i| item.files[i].clone()).collect();
+            let key = format!(
+                "tg:{}:album:{}:batch:{}",
+                item.chat_id, group, batch.message_id
+            );
+            batch.ingest_key = Some(key.clone());
+            tx.execute(
+                "INSERT INTO album_batches(user_id,chat_id,batch_key,payload) VALUES(?,?,?,?)",
+                params![
+                    item.user_id,
+                    item.chat_id,
+                    key,
+                    serde_json::to_string(&batch)?
+                ],
+            )?;
+            for id in &batch.message_ids {
+                tx.execute("INSERT INTO album_members(user_id,chat_id,message_id,batch_key) VALUES(?,?,?,?)",params![item.user_id,item.chat_id,id,key])?;
+            }
+            batches.push(batch);
+        }
+        tx.commit()?;
+        batches.sort_by_key(|batch| batch.message_id);
+        Ok(batches)
     }
 
     pub fn date(&self, user_id: i64, chat_id: i64, message_id: i64) -> Option<i64> {
@@ -262,6 +344,84 @@ mod tests {
         d.db.execute_batch("CREATE TABLE messages(user_id INTEGER,chat_id INTEGER,message_id INTEGER,status TEXT,date INTEGER,removed INTEGER DEFAULT 0,clear_blocked INTEGER DEFAULT 0,PRIMARY KEY(user_id,chat_id,message_id));").unwrap();
         d
     }
+    fn album(ids: &[i64]) -> crate::mapping::IncomingItem {
+        crate::mapping::IncomingItem {
+            ingest_key: None,
+            update_ids: ids.iter().map(|id| id + 1000).collect(),
+            chat_id: 1,
+            user_id: 1,
+            message_id: ids[0],
+            message_ids: ids.to_vec(),
+            message_dates: ids.iter().map(|&id| (id, Some(id * 100))).collect(),
+            media_group_id: Some("group".into()),
+            body: "caption".into(),
+            files: ids
+                .iter()
+                .map(|id| crate::mapping::IncomingFile {
+                    file_id: format!("file{id}"),
+                    filename: "photo.jpg".into(),
+                    mime_type: "image/jpeg".into(),
+                    size: Some(10),
+                })
+                .collect(),
+            too_large: None,
+        }
+    }
+    fn batch_database(name: &str) -> (Delivered, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("scratchbot-batches-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("delivered.sqlite3");
+        (Delivered::load(&path).unwrap(), path)
+    }
+    #[test]
+    fn late_album_parts_get_distinct_keys_and_completed_parts_are_not_reuploaded() {
+        let (mut d, path) = batch_database("late");
+        let first = d.prepare_batches(&album(&[1])).unwrap();
+        d.record_dated(1, 1, &first[0].message_dates, DeliveryStatus::Sent)
+            .unwrap();
+        let late = d.prepare_batches(&album(&[2, 3])).unwrap();
+        assert_ne!(first[0].idempotency_key(), late[0].idempotency_key());
+        assert_eq!(late[0].files.len(), 2);
+        d.record_dated(1, 1, &late[0].message_dates, DeliveryStatus::Sent)
+            .unwrap();
+        assert!(d.prepare_batches(&album(&[1, 2, 3])).unwrap().is_empty());
+        drop(d);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn restart_reconstructs_the_entire_reserved_album_even_from_one_replayed_member() {
+        let (mut d, path) = batch_database("restart");
+        let reserved = d.prepare_batches(&album(&[1, 2])).unwrap();
+        let key = reserved[0].idempotency_key();
+        drop(d);
+        let mut d = Delivered::load(&path).unwrap();
+        let replay = d.prepare_batches(&album(&[1])).unwrap();
+        assert_eq!(replay[0].idempotency_key(), key);
+        assert_eq!(replay[0].message_ids, [1, 2]);
+        assert_eq!(replay[0].files.len(), 2);
+        d.record_dated(1, 1, &replay[0].message_dates, DeliveryStatus::Sent)
+            .unwrap();
+        assert!(d.prepare_batches(&album(&[2])).unwrap().is_empty());
+        drop(d);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn crash_before_ack_and_overlapping_delivery_cannot_discard_new_album_parts() {
+        let (mut d, path) = batch_database("overlap");
+        let original = d.prepare_batches(&album(&[1])).unwrap()[0].idempotency_key();
+        drop(d);
+        let mut d = Delivered::load(&path).unwrap();
+        let replay = d.prepare_batches(&album(&[1, 2, 3])).unwrap();
+        assert_eq!(replay.len(), 2);
+        assert_eq!(replay[0].idempotency_key(), original);
+        assert_eq!(replay[0].message_ids, [1]);
+        assert_eq!(replay[1].message_ids, [2, 3]);
+        assert_ne!(replay[0].idempotency_key(), replay[1].idempotency_key());
+        drop(d);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
     #[test]
     fn deletion_keeps_dates_and_outcomes_and_retries_do_not_resurrect() {
         let mut d = setup();

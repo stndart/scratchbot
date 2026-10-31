@@ -111,11 +111,13 @@ impl Telegram {
         if !bytes.status().is_success() {
             return Err(classify_status("telegram file download", bytes.status()));
         }
-        bytes
-            .bytes()
-            .await
-            .map(|value| value.to_vec())
-            .map_err(HandleError::transient)
+        let bytes = bytes.bytes().await.map_err(HandleError::transient)?;
+        if bytes.is_empty() {
+            return Err(HandleError::Permanent(
+                "Telegram returned an empty file".into(),
+            ));
+        }
+        Ok(bytes.to_vec())
     }
 
     pub async fn send_message(&self, chat_id: i64, text: &str) -> Result<(), HandleError> {
