@@ -16,11 +16,11 @@ impl AlbumBuffer {
         let Some(group) = item.media_group_id.clone() else {
             return Some(item);
         };
-        self.groups
-            .entry(group.clone())
-            .or_default()
-            .insert(item.message_id, item);
-        self.last_seen_ms.insert(group, now_ms);
+        let messages = self.groups.entry(group.clone()).or_default();
+        if let std::collections::hash_map::Entry::Vacant(entry) = messages.entry(item.message_id) {
+            entry.insert(item);
+            self.last_seen_ms.insert(group, now_ms);
+        }
         None
     }
 
@@ -129,6 +129,14 @@ mod tests {
         assert_eq!(album.idempotency_key(), "tg:42:album:album-1");
         assert_eq!(album.update_ids, vec![1001, 1002, 1003]);
         assert_eq!(album.message_ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn repeated_polling_does_not_extend_album_grace() {
+        let mut buffer = AlbumBuffer::new();
+        buffer.push(item(1, "caption", "a"), 0);
+        buffer.push(item(1, "caption", "a"), 1000);
+        assert_eq!(buffer.take_ready(1500, 1500).len(), 1);
     }
 
     #[test]

@@ -21,6 +21,8 @@ pub struct Message {
     pub animation: Option<FilePayload>,
     pub video: Option<FilePayload>,
     pub document: Option<FilePayload>,
+    #[serde(flatten)]
+    pub other: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -87,7 +89,14 @@ pub enum Classified {
     Command {
         chat_id: i64,
         user_id: i64,
+        message_id: i64,
         command: Command,
+    },
+    Unsupported {
+        chat_id: i64,
+        user_id: i64,
+        message_id: i64,
+        date: Option<i64>,
     },
     Item(IncomingItem),
 }
@@ -152,6 +161,7 @@ pub fn classify(update: &Update, allow: &[i64]) -> Classified {
         return Classified::Command {
             chat_id: message.chat.id,
             user_id: from_id,
+            message_id: message.message_id,
             command,
         };
     }
@@ -221,6 +231,28 @@ pub fn classify(update: &Update, allow: &[i64]) -> Classified {
                 size: document.file_size,
             },
         );
+    } else if [
+        "sticker",
+        "voice",
+        "audio",
+        "video_note",
+        "contact",
+        "location",
+        "venue",
+        "poll",
+        "dice",
+        "story",
+        "paid_media",
+    ]
+    .iter()
+    .any(|key| message.other.contains_key(*key))
+    {
+        return Classified::Unsupported {
+            chat_id: message.chat.id,
+            user_id: from_id,
+            message_id: message.message_id,
+            date: message.date,
+        };
     } else if body.trim().is_empty() {
         return Classified::Ignored;
     }
@@ -293,6 +325,7 @@ mod tests {
             Classified::Command {
                 chat_id: 42,
                 user_id: 42,
+                message_id: 4,
                 command: Command::Space {
                     name: Some("My Memes".into())
                 }
@@ -330,6 +363,7 @@ mod tests {
             Classified::Command {
                 chat_id: 42,
                 user_id: 42,
+                message_id: 9,
                 command: Command::Clear
             }
         );
@@ -384,7 +418,7 @@ mod tests {
     }
 
     #[test]
-    fn stickers_and_voice_are_skipped() {
+    fn unsupported_media_is_a_failure_barrier() {
         let update = parse(
             r#"{
                 "update_id": 102,
@@ -396,7 +430,15 @@ mod tests {
                 }
             }"#,
         );
-        assert_eq!(classify(&update, &[42]), Classified::Ignored);
+        assert_eq!(
+            classify(&update, &[42]),
+            Classified::Unsupported {
+                chat_id: 42,
+                user_id: 42,
+                message_id: 7,
+                date: None
+            }
+        );
     }
 
     #[test]

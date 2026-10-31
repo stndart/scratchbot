@@ -1,12 +1,13 @@
-use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use anyhow::{Context, Result};
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::Deserialize;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
 };
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryStatus {
     #[default]
@@ -14,51 +15,99 @@ pub enum DeliveryStatus {
     Failed,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 pub struct DeliveredMessage {
     pub chat_id: i64,
     pub message_id: i64,
     #[serde(default)]
     pub status: DeliveryStatus,
+    #[serde(default)]
+    pub date: Option<i64>,
+    #[serde(default)]
+    pub removed: bool,
+    #[serde(default)]
+    pub clear_blocked: bool,
 }
 
-#[derive(Default, Serialize, Deserialize)]
-struct DeliveredFile {
+#[derive(Default, Deserialize)]
+struct LegacyFile {
     #[serde(default)]
     messages: HashMap<String, Vec<DeliveredMessage>>,
     #[serde(default)]
     dates: HashMap<String, i64>,
 }
 
-type MessageOutcomes = BTreeMap<(i64, i64), DeliveryStatus>;
-
 pub struct Delivered {
-    path: PathBuf,
-    by_user: HashMap<i64, MessageOutcomes>,
-    dates: HashMap<String, i64>,
+    db: Connection,
 }
 
 impl Delivered {
     pub fn load(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
-        let (by_user, dates) = match fs::read_to_string(&path) {
-            Ok(text) => parse_delivered_file(&text)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                (HashMap::new(), HashMap::new())
+        let database_path = path.with_extension("sqlite3");
+        if let Some(parent) = database_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut db = Connection::open(&database_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&database_path, fs::Permissions::from_mode(0o600))?;
+        }
+        db.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+            CREATE TABLE IF NOT EXISTS messages (
+                user_id INTEGER NOT NULL, chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('sent','failed')), date INTEGER,
+                removed INTEGER NOT NULL DEFAULT 0, clear_blocked INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(user_id,chat_id,message_id));
+            CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY);",
+        )?;
+        let migrated: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM migrations WHERE name='legacy-json')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !migrated {
+            let legacy_path = path.with_extension("json");
+            let legacy: LegacyFile = match fs::read_to_string(&legacy_path) {
+                Ok(text) => {
+                    serde_json::from_str(&text).context("invalid legacy delivered history")?
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => LegacyFile::default(),
+                Err(e) => return Err(e.into()),
+            };
+            let tx = db.transaction()?;
+            for (user, messages) in legacy.messages {
+                let user_id: i64 = user.parse()?;
+                for m in messages {
+                    let date = m.date.or_else(|| {
+                        legacy
+                            .dates
+                            .get(&format!("{user_id}:{}:{}", m.chat_id, m.message_id))
+                            .copied()
+                    });
+                    tx.execute("INSERT OR IGNORE INTO messages(user_id,chat_id,message_id,status,date,removed,clear_blocked) VALUES(?,?,?,?,?,?,?)",
+                        params![user_id,m.chat_id,m.message_id,status_text(m.status),date,m.removed,m.clear_blocked])?;
+                }
             }
-            Err(error) => return Err(error.into()),
-        };
-        Ok(Self {
-            path,
-            by_user,
-            dates,
-        })
+            tx.execute("INSERT INTO migrations(name) VALUES('legacy-json')", [])?;
+            tx.commit()?;
+        }
+        Ok(Self { db })
     }
 
     pub fn date(&self, user_id: i64, chat_id: i64, message_id: i64) -> Option<i64> {
-        self.dates
-            .get(&format!("{user_id}:{chat_id}:{message_id}"))
-            .copied()
+        self.db
+            .query_row(
+                "SELECT date FROM messages WHERE user_id=? AND chat_id=? AND message_id=?",
+                params![user_id, chat_id, message_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .flatten()
     }
 
     pub fn remember_dates(
@@ -67,16 +116,16 @@ impl Delivered {
         chat_id: i64,
         dates: &[(i64, Option<i64>)],
     ) -> Result<()> {
-        let mut changed = false;
-        for &(message_id, date) in dates {
+        let tx = self.db.transaction()?;
+        for &(id, date) in dates {
             if let Some(date) = date {
-                let key = format!("{user_id}:{chat_id}:{message_id}");
-                changed |= self.dates.insert(key, date) != Some(date);
+                tx.execute(
+                    "UPDATE messages SET date=? WHERE user_id=? AND chat_id=? AND message_id=?",
+                    params![date, user_id, chat_id, id],
+                )?;
             }
         }
-        if changed {
-            self.save()?;
-        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -84,285 +133,227 @@ impl Delivered {
         &mut self,
         user_id: i64,
         chat_id: i64,
-        message_ids: impl IntoIterator<Item = i64>,
+        ids: impl IntoIterator<Item = i64>,
         status: DeliveryStatus,
     ) -> Result<()> {
-        let entries = self.by_user.entry(user_id).or_default();
-        let mut changed = false;
-        for message_id in message_ids {
-            match entries.get(&(chat_id, message_id)) {
-                Some(current) if *current == status => {}
-                _ => {
-                    entries.insert((chat_id, message_id), status);
-                    changed = true;
-                }
-            }
+        let dates: Vec<_> = ids.into_iter().map(|id| (id, None)).collect();
+        self.record_dated(user_id, chat_id, &dates, status)
+    }
+
+    pub fn record_dated(
+        &mut self,
+        user_id: i64,
+        chat_id: i64,
+        messages: &[(i64, Option<i64>)],
+        status: DeliveryStatus,
+    ) -> Result<()> {
+        let tx = self.db.transaction()?;
+        for &(id, date) in messages {
+            tx.execute("INSERT INTO messages(user_id,chat_id,message_id,status,date) VALUES(?,?,?,?,?)
+                ON CONFLICT(user_id,chat_id,message_id) DO UPDATE SET status=excluded.status,date=COALESCE(excluded.date,messages.date)",
+                params![user_id,chat_id,id,status_text(status),date])?;
         }
-        if changed {
-            self.save()?;
-        }
+        tx.commit()?;
         Ok(())
     }
 
-    pub fn list_for_chat(&self, user_id: i64, chat_id: i64) -> Vec<DeliveredMessage> {
-        self.messages_for_chat(user_id, chat_id, |_| true)
+    pub fn history_for_chat(&self, user_id: i64, chat_id: i64) -> Result<Vec<DeliveredMessage>> {
+        let mut stmt=self.db.prepare("SELECT chat_id,message_id,status,date,removed,clear_blocked FROM messages WHERE user_id=? AND chat_id=? ORDER BY message_id")?;
+        Ok(stmt
+            .query_map(params![user_id, chat_id], |r| {
+                Ok(DeliveredMessage {
+                    chat_id: r.get(0)?,
+                    message_id: r.get(1)?,
+                    status: if r.get::<_, String>(2)? == "sent" {
+                        DeliveryStatus::Sent
+                    } else {
+                        DeliveryStatus::Failed
+                    },
+                    date: r.get(3)?,
+                    removed: r.get(4)?,
+                    clear_blocked: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
     }
-
-    pub fn list_sent_for_chat(&self, user_id: i64, chat_id: i64) -> Vec<DeliveredMessage> {
-        self.messages_for_chat(user_id, chat_id, |status| status == DeliveryStatus::Sent)
+    pub fn list_for_chat(&self, user_id: i64, chat_id: i64) -> Result<Vec<DeliveredMessage>> {
+        Ok(self
+            .history_for_chat(user_id, chat_id)?
+            .into_iter()
+            .filter(|m| !m.removed)
+            .collect())
     }
-
+    pub fn list_sent_for_chat(&self, user_id: i64, chat_id: i64) -> Result<Vec<DeliveredMessage>> {
+        Ok(self
+            .list_for_chat(user_id, chat_id)?
+            .into_iter()
+            .filter(|m| m.status == DeliveryStatus::Sent)
+            .collect())
+    }
+    /// Retain the outcome and timestamp permanently, including removed failures.
     pub fn remove(&mut self, user_id: i64, messages: &[DeliveredMessage]) -> Result<()> {
-        let Some(entries) = self.by_user.get_mut(&user_id) else {
-            return Ok(());
-        };
-        let mut changed = false;
-        for message in messages {
-            self.dates.remove(&format!(
-                "{user_id}:{}:{}",
-                message.chat_id, message.message_id
-            ));
-            changed |= entries
-                .remove(&(message.chat_id, message.message_id))
-                .is_some();
+        let tx = self.db.transaction()?;
+        for m in messages {
+            tx.execute("UPDATE messages SET removed=1,clear_blocked=0 WHERE user_id=? AND chat_id=? AND message_id=?",params![user_id,m.chat_id,m.message_id])?;
         }
-        if entries.is_empty() {
-            self.by_user.remove(&user_id);
-        }
-        if changed {
-            self.save()?;
-        }
+        tx.commit()?;
         Ok(())
     }
-
-    fn save(&self) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut messages = HashMap::new();
-        for (user_id, entries) in &self.by_user {
-            messages.insert(
-                user_id.to_string(),
-                entries
-                    .iter()
-                    .map(|(&(chat_id, message_id), &status)| DeliveredMessage {
-                        chat_id,
-                        message_id,
-                        status,
-                    })
-                    .collect(),
-            );
-        }
-        fs::write(
-            &self.path,
-            serde_json::to_string_pretty(&DeliveredFile {
-                messages,
-                dates: self.dates.clone(),
-            })?,
+    pub fn mark_clear_blocked(&mut self, user_id: i64, m: DeliveredMessage) -> Result<()> {
+        self.db.execute(
+            "UPDATE messages SET clear_blocked=1 WHERE user_id=? AND chat_id=? AND message_id=?",
+            params![user_id, m.chat_id, m.message_id],
         )?;
         Ok(())
     }
 }
-
+fn status_text(status: DeliveryStatus) -> &'static str {
+    match status {
+        DeliveryStatus::Sent => "sent",
+        DeliveryStatus::Failed => "failed",
+    }
+}
 pub fn delivered_path(state_dir: &Path) -> PathBuf {
-    state_dir.join("delivered.json")
+    state_dir.join("delivered.sqlite3")
 }
 
-fn parse_delivered_file(
-    text: &str,
-) -> Result<(HashMap<i64, MessageOutcomes>, HashMap<String, i64>)> {
-    let file: DeliveredFile = serde_json::from_str(text)?;
-    let mut by_user = HashMap::new();
-    for (key, messages) in file.messages {
-        let Ok(user_id) = key.parse::<i64>() else {
-            continue;
-        };
-        let entries = messages
-            .into_iter()
-            .map(|message| ((message.chat_id, message.message_id), message.status))
-            .collect();
-        by_user.insert(user_id, entries);
-    }
-    Ok((by_user, file.dates))
+#[derive(Debug, PartialEq, Eq)]
+pub struct SentReport {
+    pub latest_failure: Option<DeliveredMessage>,
+    pub boundary: Option<DeliveredMessage>,
+    pub remaining: bool,
 }
 
-impl Delivered {
-    fn messages_for_chat(
-        &self,
-        user_id: i64,
-        chat_id: i64,
-        keep: impl Fn(DeliveryStatus) -> bool,
-    ) -> Vec<DeliveredMessage> {
-        let Some(entries) = self.by_user.get(&user_id) else {
-            return Vec::new();
-        };
-        let mut messages = Vec::new();
-        for (&(entry_chat, message_id), &status) in entries {
-            if entry_chat == chat_id && keep(status) {
-                messages.push(DeliveredMessage {
-                    chat_id: entry_chat,
-                    message_id,
-                    status,
-                });
-            }
-        }
-        messages
-    }
-}
-
-/// Oldest sent message such that every later message in `existing` was also sent.
-/// `existing` is the messages still present in the chat, in any order.
-pub fn oldest_sent_tail(existing: &[DeliveredMessage]) -> Option<DeliveredMessage> {
-    let mut ordered = existing.to_vec();
-    ordered.sort_by_key(|message| message.message_id);
-    let start = ordered
+/// A removed failure no longer blocks earlier successful history. Removed successes
+/// still supply the date when the entire successful tail has been cleared.
+pub fn sent_report(history: &[DeliveredMessage]) -> SentReport {
+    let latest_failure = history
         .iter()
-        .rposition(|message| message.status == DeliveryStatus::Failed)
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    ordered[start..]
-        .iter()
-        .find(|message| message.status == DeliveryStatus::Sent)
-        .copied()
+        .filter(|m| !m.removed && m.status == DeliveryStatus::Failed)
+        .max_by_key(|m| m.message_id)
+        .copied();
+    let after = latest_failure.map(|m| m.message_id).unwrap_or(i64::MIN);
+    let sent = || {
+        history
+            .iter()
+            .filter(|m| m.message_id > after && m.status == DeliveryStatus::Sent)
+    };
+    let present = sent()
+        .filter(|m| !m.removed)
+        .min_by_key(|m| m.message_id)
+        .copied();
+    SentReport {
+        latest_failure,
+        boundary: present.or_else(|| sent().min_by_key(|m| m.message_id).copied()),
+        remaining: present.is_some(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn dates_persist_and_are_removed_with_messages() {
-        let path =
-            std::env::temp_dir().join(format!("scratchwall-dates-{}.json", std::process::id()));
-        let _ = fs::remove_file(&path);
-        let mut delivered = Delivered::load(&path).unwrap();
-        delivered
-            .record(42, 42, [10], DeliveryStatus::Sent)
-            .unwrap();
-        delivered
-            .remember_dates(42, 42, &[(10, Some(12345))])
-            .unwrap();
-        let mut reloaded = Delivered::load(&path).unwrap();
-        assert_eq!(reloaded.date(42, 42, 10), Some(12345));
-        let messages = reloaded.list_for_chat(42, 42);
-        reloaded.remove(42, &messages).unwrap();
-        assert_eq!(Delivered::load(&path).unwrap().date(42, 42, 10), None);
-        let _ = fs::remove_file(path);
+    fn history() -> Delivered {
+        Delivered {
+            db: Connection::open_in_memory().unwrap(),
+        }
     }
-
-    #[test]
-    fn records_only_successful_messages_per_chat() {
-        let directory =
-            std::env::temp_dir().join(format!("scratchwall-delivered-{}", std::process::id()));
-        let path = directory.join("delivered.json");
-        let _ = fs::remove_dir_all(&directory);
-        let mut delivered = Delivered::load(&path).unwrap();
-        delivered
-            .record(42, 42, [10, 11, 11], DeliveryStatus::Sent)
-            .unwrap();
-        delivered
-            .record(42, 99, [12], DeliveryStatus::Sent)
-            .unwrap();
-        delivered
-            .record(7, 42, [13], DeliveryStatus::Failed)
-            .unwrap();
-        assert_eq!(
-            delivered.list_sent_for_chat(42, 42),
-            vec![
-                DeliveredMessage {
-                    chat_id: 42,
-                    message_id: 10,
-                    status: DeliveryStatus::Sent
-                },
-                DeliveredMessage {
-                    chat_id: 42,
-                    message_id: 11,
-                    status: DeliveryStatus::Sent
-                },
-            ]
-        );
-        assert!(delivered.list_sent_for_chat(7, 42).is_empty());
-        delivered
-            .remove(
-                42,
-                &[DeliveredMessage {
-                    chat_id: 42,
-                    message_id: 10,
-                    status: DeliveryStatus::Sent,
-                }],
-            )
-            .unwrap();
-        let reloaded = Delivered::load(&path).unwrap();
-        assert_eq!(
-            reloaded.list_for_chat(42, 42),
-            vec![DeliveredMessage {
-                chat_id: 42,
-                message_id: 11,
-                status: DeliveryStatus::Sent
-            }]
-        );
-        assert_eq!(reloaded.list_for_chat(42, 99).len(), 1);
-        assert_eq!(reloaded.list_for_chat(7, 42).len(), 1);
-        assert_eq!(
-            reloaded.list_for_chat(7, 42)[0].status,
-            DeliveryStatus::Failed
-        );
-        let _ = fs::remove_dir_all(directory);
+    fn setup() -> Delivered {
+        let d = history();
+        d.db.execute_batch("CREATE TABLE messages(user_id INTEGER,chat_id INTEGER,message_id INTEGER,status TEXT,date INTEGER,removed INTEGER DEFAULT 0,clear_blocked INTEGER DEFAULT 0,PRIMARY KEY(user_id,chat_id,message_id));").unwrap();
+        d
     }
-
     #[test]
-    fn empty_chat_has_nothing_to_clear() {
-        let delivered =
-            Delivered::load(std::env::temp_dir().join("missing-delivered.json")).unwrap();
-        assert!(delivered.list_for_chat(1, 1).is_empty());
-    }
-
-    #[test]
-    fn older_file_without_status_counts_as_sent() {
-        let directory =
-            std::env::temp_dir().join(format!("scratchwall-delivered-old-{}", std::process::id()));
-        let path = directory.join("delivered.json");
-        let _ = fs::remove_dir_all(&directory);
-        fs::create_dir_all(&directory).unwrap();
-        fs::write(
-            &path,
-            r#"{"messages":{"42":[{"chat_id":42,"message_id":3}]}}"#,
+    fn deletion_keeps_dates_and_outcomes_and_retries_do_not_resurrect() {
+        let mut d = setup();
+        d.record_dated(
+            1,
+            1,
+            &[(1, Some(123)), (2, Some(124))],
+            DeliveryStatus::Sent,
         )
         .unwrap();
-        let delivered = Delivered::load(&path).unwrap();
-        assert_eq!(
-            delivered.list_sent_for_chat(42, 42),
-            vec![DeliveredMessage {
-                chat_id: 42,
-                message_id: 3,
-                status: DeliveryStatus::Sent
-            }]
-        );
-        let _ = fs::remove_dir_all(directory);
+        let m = d.list_for_chat(1, 1).unwrap();
+        d.remove(1, &m).unwrap();
+        assert!(d.list_for_chat(1, 1).unwrap().is_empty());
+        assert_eq!(d.date(1, 1, 1), Some(123));
+        d.record(1, 1, [1], DeliveryStatus::Sent).unwrap();
+        assert!(d.list_for_chat(1, 1).unwrap().is_empty());
+        let report = sent_report(&d.history_for_chat(1, 1).unwrap());
+        assert!(!report.remaining);
+        assert_eq!(report.boundary.unwrap().message_id, 1);
     }
-
     #[test]
-    fn oldest_sent_tail_stops_at_a_later_failure() {
-        let sent = |message_id| DeliveredMessage {
-            chat_id: 1,
-            message_id,
-            status: DeliveryStatus::Sent,
-        };
-        let failed = |message_id| DeliveredMessage {
-            chat_id: 1,
-            message_id,
-            status: DeliveryStatus::Failed,
-        };
-        assert_eq!(
-            oldest_sent_tail(&[sent(1), failed(2), sent(4), sent(3)])
-                .map(|message| message.message_id),
-            Some(3)
+    fn removing_failures_moves_boundary_back_until_empty() {
+        let mut d = setup();
+        d.record_dated(
+            1,
+            1,
+            &[(1, Some(10)), (3, Some(30)), (5, Some(50))],
+            DeliveryStatus::Sent,
+        )
+        .unwrap();
+        d.record_dated(
+            1,
+            1,
+            &[(2, Some(20)), (4, Some(40))],
+            DeliveryStatus::Failed,
+        )
+        .unwrap();
+        let report = sent_report(&d.history_for_chat(1, 1).unwrap());
+        assert_eq!(report.boundary.unwrap().message_id, 5);
+        assert_eq!(report.latest_failure.unwrap().message_id, 4);
+        d.remove(1, &[report.latest_failure.unwrap()]).unwrap();
+        let report = sent_report(&d.history_for_chat(1, 1).unwrap());
+        assert_eq!(report.boundary.unwrap().message_id, 3);
+        assert_eq!(report.latest_failure.unwrap().message_id, 2);
+        d.remove(1, &[report.latest_failure.unwrap()]).unwrap();
+        let report = sent_report(&d.history_for_chat(1, 1).unwrap());
+        assert_eq!(report.boundary.unwrap().message_id, 1);
+        assert!(report.latest_failure.is_none());
+    }
+    #[test]
+    fn users_chats_and_successful_retry_are_isolated() {
+        let mut d = setup();
+        d.record(1, 1, [1], DeliveryStatus::Failed).unwrap();
+        d.record(1, 1, [1], DeliveryStatus::Sent).unwrap();
+        d.record(2, 1, [1], DeliveryStatus::Failed).unwrap();
+        d.record(1, 2, [1], DeliveryStatus::Failed).unwrap();
+        assert!(
+            sent_report(&d.history_for_chat(1, 1).unwrap())
+                .latest_failure
+                .is_none()
         );
-        assert_eq!(
-            oldest_sent_tail(&[sent(1), sent(3), sent(4)]).map(|message| message.message_id),
-            Some(1)
+        assert!(
+            sent_report(&d.history_for_chat(2, 1).unwrap())
+                .latest_failure
+                .is_some()
         );
-        assert_eq!(oldest_sent_tail(&[sent(1), failed(5)]), None);
-        assert_eq!(oldest_sent_tail(&[]), None);
+        assert!(
+            sent_report(&d.history_for_chat(1, 2).unwrap())
+                .latest_failure
+                .is_some()
+        );
+    }
+    #[test]
+    fn legacy_json_import_is_idempotent_and_preserves_known_dates() {
+        let dir = std::env::temp_dir().join(format!("scratchbot-migration-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("delivered.sqlite3");
+        fs::write(
+            path.with_extension("json"),
+            r#"{"messages":{"1":[{"chat_id":1,"message_id":3}]},"dates":{"1:1:3":123}}"#,
+        )
+        .unwrap();
+        let mut d = Delivered::load(&path).unwrap();
+        assert_eq!(d.date(1, 1, 3), Some(123));
+        let m = d.list_for_chat(1, 1).unwrap();
+        d.remove(1, &m).unwrap();
+        drop(d);
+        let d = Delivered::load(&path).unwrap();
+        assert!(d.list_for_chat(1, 1).unwrap().is_empty());
+        assert_eq!(d.history_for_chat(1, 1).unwrap().len(), 1);
+        drop(d);
+        fs::remove_dir_all(dir).unwrap();
     }
 }

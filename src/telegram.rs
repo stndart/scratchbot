@@ -132,107 +132,96 @@ impl Telegram {
             .await
     }
 
-    pub async fn quote_message(
+    pub async fn send_report(
         &self,
         chat_id: i64,
-        reply_to_message_id: i64,
-        text: &str,
-    ) -> Result<QuoteOutcome, HandleError> {
-        match self
-            .send_message_opts(chat_id, text, Some(reply_to_message_id), None)
-            .await?
-        {
-            SendOutcome::Sent(message) => {
-                if message
-                    .pointer("/reply_to_message/message_id")
-                    .and_then(|id| id.as_i64())
-                    == Some(reply_to_message_id)
-                {
-                    let message_id = message
-                        .get("message_id")
-                        .and_then(|id| id.as_i64())
-                        .ok_or_else(|| {
-                            HandleError::Permanent(
-                                "Telegram returned a reply without a message ID".into(),
-                            )
-                        })?;
-                    let date = message
-                        .pointer("/reply_to_message/date")
-                        .and_then(|v| v.as_i64());
-                    tracing::info!(reply_target = reply_to_message_id, reply_message_id = message_id, target_date = ?date, "Telegram confirmed reply target");
-                    return Ok(QuoteOutcome::Attached { message_id, date });
-                }
-                let message_id = message
-                    .get("message_id")
-                    .and_then(|id| id.as_i64())
-                    .ok_or_else(|| {
-                        HandleError::Permanent(
-                            "Telegram returned a message without an ID or reply".into(),
-                        )
-                    })?;
-                match self.delete_message(chat_id, message_id).await? {
-                    DeleteOutcome::Deleted | DeleteOutcome::Gone => Ok(QuoteOutcome::Missing),
-                    DeleteOutcome::Forbidden => Err(HandleError::Permanent(
-                        "Telegram sent an unquoted message and would not remove it".into(),
-                    )),
-                }
-            }
-            SendOutcome::Rejected(description) if is_missing_reply(&description) => {
-                Ok(QuoteOutcome::Missing)
-            }
-            SendOutcome::Rejected(description) => Err(HandleError::Permanent(description)),
+        report: &scratchwall_telegram::delivered::SentReport,
+        reply_to: Option<i64>,
+    ) -> Result<ReportOutcome, HandleError> {
+        let (text, entities) = report_text(report);
+        let mut body = serde_json::json!({"chat_id":chat_id,"text":text,"entities":entities});
+        if let Some(message_id) = reply_to {
+            body["reply_parameters"] =
+                serde_json::json!({"message_id":message_id,"allow_sending_without_reply":false});
         }
+        let response = self
+            .http
+            .post(format!("{}/sendMessage", self.api_base))
+            .json(&body)
+            .send()
+            .await
+            .map_err(HandleError::transient)?;
+        let status = response.status();
+        if status.is_server_error() || status.as_u16() == 429 {
+            return Err(HandleError::Transient(format!(
+                "telegram sendMessage {status}"
+            )));
+        }
+        let payload: ApiResponse<serde_json::Value> =
+            response.json().await.map_err(HandleError::transient)?;
+        if !payload.ok {
+            let description = payload
+                .description
+                .unwrap_or_else(|| format!("telegram sendMessage {status}"));
+            if is_missing_reply(&description) {
+                return Ok(ReportOutcome::Missing);
+            }
+            return Err(HandleError::Permanent(description));
+        }
+        let message = payload.result.unwrap_or_default();
+        let message_id = message
+            .get("message_id")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| {
+                HandleError::Permanent("Telegram returned a report without an ID".into())
+            })?;
+        let returned_target = message
+            .pointer("/reply_to_message/message_id")
+            .and_then(|v| v.as_i64());
+        let date = if returned_target == reply_to {
+            message
+                .pointer("/reply_to_message/date")
+                .and_then(|v| v.as_i64())
+        } else {
+            None
+        };
+        tracing::info!(
+            chat_id,
+            ?reply_to,
+            ?returned_target,
+            ?date,
+            "Telegram saved-report reply result"
+        );
+        // A useful dated report stays visible even if Telegram omits the shortcut.
+        Ok(ReportOutcome::Sent { message_id, date })
     }
 
-    pub async fn edit_sent_boundary(
+    pub async fn edit_report(
         &self,
         chat_id: i64,
         message_id: i64,
-        date: Option<i64>,
+        report: &scratchwall_telegram::delivered::SentReport,
     ) -> Result<(), HandleError> {
-        let (text, entities) = boundary_text(date);
-        let url = format!("{}/editMessageText", self.api_base);
-        let payload: ApiResponse<serde_json::Value> = self
-            .http
-            .post(url)
-            .json(&serde_json::json!({
-                "chat_id": chat_id, "message_id": message_id, "text": text, "entities": entities,
-            }))
-            .send()
-            .await
-            .map_err(HandleError::transient)?
-            .json()
-            .await
-            .map_err(HandleError::transient)?;
-        if payload.ok {
-            Ok(())
-        } else {
-            Err(HandleError::Permanent(payload.description.unwrap_or_else(
-                || "Telegram could not update the saved boundary".into(),
-            )))
+        let (text, entities) = report_text(report);
+        let response=self.http.post(format!("{}/editMessageText",self.api_base)).json(&serde_json::json!({"chat_id":chat_id,"message_id":message_id,"text":text,"entities":entities})).send().await.map_err(HandleError::transient)?;
+        let status = response.status();
+        if status.is_server_error() || status.as_u16() == 429 {
+            return Err(HandleError::Transient(format!(
+                "telegram editMessageText {status}"
+            )));
         }
-    }
-
-    pub async fn send_sent_boundary(&self, chat_id: i64, date: i64) -> Result<(), HandleError> {
-        let (text, entities) = boundary_text(Some(date));
-        let url = format!("{}/sendMessage", self.api_base);
-        let payload: ApiResponse<serde_json::Value> = self
-            .http
-            .post(url)
-            .json(&serde_json::json!({
-                "chat_id": chat_id, "text": text, "entities": entities,
-            }))
-            .send()
-            .await
-            .map_err(HandleError::transient)?
-            .json()
-            .await
-            .map_err(HandleError::transient)?;
-        if payload.ok {
+        let payload: ApiResponse<serde_json::Value> =
+            response.json().await.map_err(HandleError::transient)?;
+        if payload.ok
+            || payload
+                .description
+                .as_deref()
+                .is_some_and(|s| s.contains("not modified"))
+        {
             Ok(())
         } else {
             Err(HandleError::Permanent(payload.description.unwrap_or_else(
-                || "Telegram could not send the saved boundary".into(),
+                || "Telegram could not update the report".into(),
             )))
         }
     }
@@ -317,45 +306,53 @@ impl Telegram {
         )))
     }
 
-    /// Asks Telegram whether this message is still in the chat.
-    /// Editing a user's message is refused when it exists, and reported missing when it was deleted.
+    /// Validate the source through Telegram's forwarding RPC. Permission to edit
+    /// and cached reply objects do not establish that a source can still be used.
+    /// The silent test copy is immediately removed; never touch the source.
     pub async fn probe_message(
         &self,
         chat_id: i64,
         message_id: i64,
     ) -> Result<MessagePresence, HandleError> {
-        let url = format!("{}/editMessageReplyMarkup", self.api_base);
-        let response = self
-            .http
-            .post(url)
-            .json(&serde_json::json!({
-                "chat_id": chat_id,
-                "message_id": message_id,
-            }))
-            .send()
-            .await
-            .map_err(HandleError::transient)?;
+        let response=self.http.post(format!("{}/forwardMessage",self.api_base)).json(&serde_json::json!({
+            "chat_id":chat_id,"from_chat_id":chat_id,"message_id":message_id,"disable_notification":true,
+        })).send().await.map_err(HandleError::transient)?;
         let status = response.status();
         if status.is_server_error() || status.as_u16() == 429 {
             return Err(HandleError::Transient(format!(
-                "telegram editMessageReplyMarkup {status}"
+                "telegram forwardMessage {status}"
             )));
         }
-        let payload: ApiResponse<serde_json::Value> = match response.json().await {
-            Ok(payload) => payload,
-            Err(_) => {
-                return Err(HandleError::Permanent(format!(
-                    "telegram editMessageReplyMarkup {status}"
-                )));
-            }
-        };
-        if payload.ok {
-            return Ok(MessagePresence::Present);
+        let payload: ApiResponse<serde_json::Value> =
+            response.json().await.map_err(HandleError::transient)?;
+        if !payload.ok {
+            let description = payload
+                .description
+                .unwrap_or_else(|| format!("telegram forwardMessage {status}"));
+            return match classify_forward_probe(&description) {
+                Some(presence) => Ok(presence),
+                None => Err(HandleError::Permanent(description)),
+            };
         }
-        let description = payload
-            .description
-            .unwrap_or_else(|| "telegram editMessageReplyMarkup failed".into());
-        classify_edit_probe(&description).ok_or(HandleError::Permanent(description))
+        let copy_id = payload
+            .result
+            .as_ref()
+            .and_then(|m| m.get("message_id"))
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| {
+                HandleError::Permanent("Telegram returned a test copy without an ID".into())
+            })?;
+        if copy_id == message_id {
+            return Err(HandleError::Permanent(
+                "Telegram verification returned the source ID; refusing to delete it".into(),
+            ));
+        }
+        match self.delete_message(chat_id, copy_id).await? {
+            DeleteOutcome::Deleted | DeleteOutcome::Gone => Ok(MessagePresence::Present),
+            DeleteOutcome::Forbidden => Err(HandleError::Permanent(
+                "Telegram would not remove the verification copy".into(),
+            )),
+        }
     }
 
     pub async fn delete_message(
@@ -428,22 +425,71 @@ enum SendOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuoteOutcome {
-    Attached { message_id: i64, date: Option<i64> },
+pub enum ReportOutcome {
+    Sent { message_id: i64, date: Option<i64> },
     Missing,
 }
 
-fn boundary_text(date: Option<i64>) -> (String, serde_json::Value) {
-    match date {
-        Some(date) => {
-            let prefix = "Forwards I recorded after ";
-            let placeholder = "this date";
-            let text = format!("{prefix}{placeholder} and before this command are saved to Scratchwall. Check other messages and those sent at that exact time before deleting.");
-            let entities = serde_json::json!([{ "type": "date_time", "offset": prefix.len(), "length": placeholder.len(), "unix_time": date, "date_time_format": "dT" }]);
-            (text, entities)
+fn report_text(
+    report: &scratchwall_telegram::delivered::SentReport,
+) -> (String, serde_json::Value) {
+    let mut text = String::new();
+    let mut entities = Vec::new();
+    let mut date = |text: &mut String,
+                    message: scratchwall_telegram::delivered::DeliveredMessage| {
+        match message.date {
+            Some(timestamp) => {
+                let offset = text.encode_utf16().count();
+                text.push_str("this date");
+                entities.push(serde_json::json!({"type":"date_time","offset":offset,"length":9,"unix_time":timestamp,"date_time_format":"dT"}));
+            }
+            None => text.push_str("an unknown date (older history has no timestamp)"),
         }
-        None => ("The replied-to forward and later forwards I recorded before this command are saved to Scratchwall. The date is unavailable; check other messages before deleting.".into(), serde_json::json!([])),
+    };
+    if let Some(boundary) = report.boundary {
+        let same_second = boundary.date.is_some()
+            && report
+                .latest_failure
+                .is_some_and(|f| f.date == boundary.date);
+        if same_second {
+            text.push_str("All remaining forwards after the latest failure through this command are saved to Scratchwall. First saved forward: ");
+            date(&mut text, boundary);
+            text.push('.');
+        } else {
+            text.push_str("All remaining forwards since ");
+            date(&mut text, boundary);
+            text.push_str(" through this command are saved to Scratchwall.");
+        }
+        if report.remaining {
+            if boundary.clear_blocked {
+                text.push_str(" /clear could not delete the remaining Telegram copies (48-hour limit or protected messages).");
+            } else {
+                text.push_str(
+                    " Telegram copies remain. /clear cannot delete copies older than 48 hours.",
+                );
+            }
+        }
     }
+    if !report.remaining {
+        if let Some(failure) = report.latest_failure {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            if report.boundary.is_none() {
+                text.push_str("No saved forwards follow the latest failure. ");
+            }
+            text.push_str("Latest forward failure: ");
+            date(&mut text, failure);
+            text.push_str(
+                ". Delete that failed forward for both participants, then run /show-sent again.",
+            );
+        } else if report.boundary.is_some() {
+            text.push_str(" No forward failures remain.");
+        } else {
+            text.push_str("No recorded forwards remain in this chat.");
+        }
+    }
+    (text, serde_json::Value::Array(entities))
 }
 
 fn is_missing_reply(description: &str) -> bool {
@@ -467,15 +513,13 @@ pub enum DeleteOutcome {
     Forbidden,
 }
 
-pub fn classify_edit_probe(description: &str) -> Option<MessagePresence> {
+pub fn classify_forward_probe(description: &str) -> Option<MessagePresence> {
     let description = description.to_ascii_lowercase();
     if description.contains("message_id_invalid")
-        || description.contains("message to edit not found")
+        || description.contains("message to forward not found")
         || description.contains("message not found")
     {
         Some(MessagePresence::Gone)
-    } else if description.contains("can't be edited") || description.contains("not modified") {
-        Some(MessagePresence::Present)
     } else {
         None
     }
@@ -621,6 +665,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn report_dates_are_exact_and_equal_seconds_do_not_include_the_failure() {
+        use scratchwall_telegram::delivered::{DeliveredMessage, DeliveryStatus, SentReport};
+        let failure = DeliveredMessage {
+            chat_id: 1,
+            message_id: 2,
+            status: DeliveryStatus::Failed,
+            date: Some(100),
+            removed: false,
+            clear_blocked: false,
+        };
+        let boundary = DeliveredMessage {
+            message_id: 3,
+            status: DeliveryStatus::Sent,
+            removed: true,
+            ..failure
+        };
+        let (text, entities) = report_text(&SentReport {
+            latest_failure: Some(failure),
+            boundary: Some(boundary),
+            remaining: false,
+        });
+        assert!(text.contains("after the latest failure"));
+        for entity in entities.as_array().unwrap() {
+            let offset = entity["offset"].as_u64().unwrap() as usize;
+            let len = entity["length"].as_u64().unwrap() as usize;
+            let units: Vec<_> = text.encode_utf16().collect();
+            assert_eq!(
+                String::from_utf16(&units[offset..offset + len]).unwrap(),
+                "this date"
+            );
+            assert_eq!(entity["unix_time"], 100);
+        }
+        let (text, _) = report_text(&SentReport {
+            latest_failure: Some(failure),
+            boundary: None,
+            remaining: false,
+        });
+        assert!(text.contains("No saved forwards follow"));
+        let (text, entities) = report_text(&SentReport {
+            latest_failure: None,
+            boundary: None,
+            remaining: false,
+        });
+        assert!(text.contains("No recorded forwards remain"));
+        assert!(entities.as_array().unwrap().is_empty());
+    }
+
+    #[test]
     fn ingest_error_form_replies_to_the_source_message() {
         let form = message_form(42, "scratchwall ingest 500: boom", Some(99), None);
         assert_eq!(
@@ -636,28 +728,20 @@ mod tests {
     }
 
     #[test]
-    fn edit_probe_treats_a_refused_edit_as_still_present() {
+    fn forward_probe_does_not_mistake_permissions_for_presence() {
         assert_eq!(
-            classify_edit_probe("Bad Request: message can't be edited"),
-            Some(MessagePresence::Present)
-        );
-        assert_eq!(
-            classify_edit_probe("Bad Request: message is not modified"),
-            Some(MessagePresence::Present)
-        );
-        assert_eq!(
-            classify_edit_probe("Bad Request: message to edit not found"),
+            classify_forward_probe("Bad Request: message to forward not found"),
             Some(MessagePresence::Gone)
         );
         assert_eq!(
-            classify_edit_probe("Bad Request: MESSAGE_ID_INVALID"),
+            classify_forward_probe("Bad Request: MESSAGE_ID_INVALID"),
             Some(MessagePresence::Gone)
         );
         assert_eq!(
-            classify_edit_probe("Bad Request: message not found"),
-            Some(MessagePresence::Gone)
+            classify_forward_probe("Bad Request: message can't be forwarded"),
+            None
         );
-        assert_eq!(classify_edit_probe("Bad Request: chat not found"), None);
+        assert_eq!(classify_forward_probe("Bad Request: chat not found"), None);
     }
 
     #[test]
