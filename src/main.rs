@@ -17,7 +17,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use telegram::{
-    DeleteOutcome, HandleError, MessagePresence, Telegram, post_ingest, request_telegram_bind,
+    DeleteOutcome, HandleError, MessagePresence, QuoteOutcome, Telegram, post_ingest,
+    request_telegram_bind,
 };
 
 #[tokio::main]
@@ -418,8 +419,8 @@ fn remember(delivered: &mut Delivered, item: &mapping::IncomingItem, status: Del
 }
 
 const SHOW_SENT_QUOTE: &str = "\
-Select from the quoted message to the bottom. It is the oldest forward that reached Scratchwall, \
-and every forward after it that is still in the chat also reached Scratchwall.";
+If this message replies to a forward, you can select from that forward to the bottom. \
+The recorded forwards after it reached Scratchwall.";
 
 async fn show_sent(
     telegram: &Telegram,
@@ -471,29 +472,29 @@ async fn show_sent(
     if let Err(error) = delivered.remove(user_id, &gone) {
         tracing::warn!(error = %error, "could not update delivered message list");
     }
-    let Some(marker) = delivered::oldest_sent_tail(&tail) else {
+    if delivered::oldest_sent_tail(&tail).is_none() {
         let text = if saw_failure {
             "A forward that did not reach Scratchwall is still in this chat. Delete it, then run /show-sent again."
         } else {
             "Every recorded forward is already gone from this chat."
         };
         return telegram.send_message(chat_id, text).await;
-    };
-    match telegram
-        .quote_message(chat_id, marker.message_id, SHOW_SENT_QUOTE)
-        .await
-    {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            tracing::warn!(error = %error, "could not quote the oldest saved forward");
-            let text = if error.message().to_ascii_lowercase().contains("not found") {
-                "That forward disappeared while I was checking. Run /show-sent again."
-            } else {
-                "I found the forward, but Telegram would not let me quote it. Run /show-sent again."
-            };
-            telegram.send_message(chat_id, text).await
+    }
+    tail.sort_by_key(|message| message.message_id);
+    for marker in tail {
+        match telegram
+            .quote_message(chat_id, marker.message_id, SHOW_SENT_QUOTE)
+            .await
+        {
+            Ok(QuoteOutcome::Attached) => return Ok(()),
+            Ok(QuoteOutcome::Missing) => continue,
+            Err(error) => {
+                tracing::warn!(error = %error, "could not quote the saved forward");
+                return telegram.send_message(chat_id, "Telegram could not attach a reply to a saved forward. Please try /show-sent again.").await;
+            }
         }
     }
+    telegram.send_message(chat_id, "Telegram could not attach a reply to any saved forward. Please check the chat before deleting messages.").await
 }
 
 fn ingest_user_message(error: &HandleError) -> String {
@@ -507,7 +508,9 @@ fn ingest_user_message(error: &HandleError) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::clear_summary;
+    use super::*;
+    use axum::{Json, Router, extract::State, routing::post};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn clear_summary_leaves_failures_and_mentions_skips() {
@@ -519,5 +522,57 @@ mod tests {
         let empty = clear_summary(0, 0, true);
         assert!(empty.contains("Removed no Telegram messages"));
         assert!(empty.contains("Stopped early"));
+    }
+
+    #[tokio::test]
+    async fn show_sent_skips_deleted_and_unquoted_targets() {
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        let app = Router::new()
+            .route("/sendChatAction", post(|| async { Json(serde_json::json!({"ok": true})) }))
+            .route("/editMessageReplyMarkup", post(|Json(body): Json<serde_json::Value>| async move {
+                let description = if body["message_id"] == 9 { "Bad Request: message to edit not found" } else { "Bad Request: message can't be edited" };
+                Json(serde_json::json!({"ok": false, "description": description}))
+            }))
+            .route("/sendMessage", post(|State(events): State<Arc<Mutex<Vec<String>>>>, axum::Form(form): axum::Form<std::collections::HashMap<String, String>>| async move {
+                let params: serde_json::Value = serde_json::from_str(&form["reply_parameters"]).unwrap();
+                let id = params["message_id"].as_i64().unwrap();
+                events.lock().unwrap().push(format!("reply {id}"));
+                match id {
+                    10 => Json(serde_json::json!({"ok": true, "result": {"message_id": 100}})),
+                    11 => Json(serde_json::json!({"ok": false, "description": "Bad Request: replied message not found"})),
+                    12 => Json(serde_json::json!({"ok": true, "result": {"message_id": 101, "reply_to_message": {"message_id": 12}}})),
+                    _ => panic!("unexpected reply target"),
+                }
+            }))
+            .route("/deleteMessage", post(|State(events): State<Arc<Mutex<Vec<String>>>>, axum::Form(form): axum::Form<std::collections::HashMap<String, String>>| async move {
+                events.lock().unwrap().push(format!("delete {}", form["message_id"]));
+                Json(serde_json::json!({"ok": true, "result": true}))
+            }))
+            .with_state(events.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let path = std::env::temp_dir().join(format!("show-sent-test-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut delivered = Delivered::load(&path).unwrap();
+        delivered
+            .record(1, 1, [9, 10, 11, 12], DeliveryStatus::Sent)
+            .unwrap();
+        let telegram = Telegram::with_test_api(format!("http://{address}"));
+        show_sent(&telegram, &mut delivered, 1, 1).await.unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["reply 10", "delete 100", "reply 11", "reply 12"]
+        );
+        assert_eq!(
+            delivered
+                .list_for_chat(1, 1)
+                .iter()
+                .map(|x| x.message_id)
+                .collect::<Vec<_>>(),
+            [10, 11, 12]
+        );
+        server.abort();
+        let _ = std::fs::remove_file(path);
     }
 }

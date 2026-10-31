@@ -5,6 +5,7 @@ use serde::Deserialize;
 pub struct Telegram {
     http: reqwest::Client,
     token: String,
+    api_base: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -25,8 +26,18 @@ impl Telegram {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(45))
                 .build()?,
+            api_base: format!("https://api.telegram.org/bot{token}"),
             token,
         })
+    }
+
+    #[cfg(test)]
+    pub fn with_test_api(api_base: String) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            token: String::new(),
+            api_base,
+        }
     }
 
     pub async fn get_updates(
@@ -126,12 +137,37 @@ impl Telegram {
         chat_id: i64,
         reply_to_message_id: i64,
         text: &str,
-    ) -> Result<(), HandleError> {
+    ) -> Result<QuoteOutcome, HandleError> {
         match self
             .send_message_opts(chat_id, text, Some(reply_to_message_id), None)
             .await?
         {
-            SendOutcome::Sent => Ok(()),
+            SendOutcome::Sent(message) => {
+                if message
+                    .pointer("/reply_to_message/message_id")
+                    .and_then(|id| id.as_i64())
+                    == Some(reply_to_message_id)
+                {
+                    return Ok(QuoteOutcome::Attached);
+                }
+                let message_id = message
+                    .get("message_id")
+                    .and_then(|id| id.as_i64())
+                    .ok_or_else(|| {
+                        HandleError::Permanent(
+                            "Telegram returned a message without an ID or reply".into(),
+                        )
+                    })?;
+                match self.delete_message(chat_id, message_id).await? {
+                    DeleteOutcome::Deleted | DeleteOutcome::Gone => Ok(QuoteOutcome::Missing),
+                    DeleteOutcome::Forbidden => Err(HandleError::Permanent(
+                        "Telegram sent an unquoted message and would not remove it".into(),
+                    )),
+                }
+            }
+            SendOutcome::Rejected(description) if is_missing_reply(&description) => {
+                Ok(QuoteOutcome::Missing)
+            }
             SendOutcome::Rejected(description) => Err(HandleError::Permanent(description)),
         }
     }
@@ -147,7 +183,7 @@ impl Telegram {
     }
 
     pub async fn send_typing(&self, chat_id: i64) {
-        let url = format!("https://api.telegram.org/bot{}/sendChatAction", self.token);
+        let url = format!("{}/sendChatAction", self.api_base);
         let _ = self
             .http
             .post(url)
@@ -170,7 +206,7 @@ impl Telegram {
             .send_message_opts(chat_id, text, reply_to_message_id, connect_url)
             .await?
         {
-            SendOutcome::Sent => Ok(()),
+            SendOutcome::Sent(_) => Ok(()),
             SendOutcome::Rejected(description) => {
                 tracing::warn!(description, "telegram sendMessage failed");
                 Ok(())
@@ -185,7 +221,7 @@ impl Telegram {
         reply_to_message_id: Option<i64>,
         connect_url: Option<&str>,
     ) -> Result<SendOutcome, HandleError> {
-        let url = format!("https://api.telegram.org/bot{}/sendMessage", self.token);
+        let url = format!("{}/sendMessage", self.api_base);
         let form = message_form(chat_id, text, reply_to_message_id, connect_url);
         let response = self
             .http
@@ -209,7 +245,7 @@ impl Telegram {
             }
         };
         if payload.ok {
-            return Ok(SendOutcome::Sent);
+            return Ok(SendOutcome::Sent(payload.result.unwrap_or_default()));
         }
         Ok(SendOutcome::Rejected(payload.description.unwrap_or_else(
             || format!("telegram sendMessage {status}"),
@@ -223,10 +259,7 @@ impl Telegram {
         chat_id: i64,
         message_id: i64,
     ) -> Result<MessagePresence, HandleError> {
-        let url = format!(
-            "https://api.telegram.org/bot{}/editMessageReplyMarkup",
-            self.token
-        );
+        let url = format!("{}/editMessageReplyMarkup", self.api_base);
         let response = self
             .http
             .post(url)
@@ -265,7 +298,7 @@ impl Telegram {
         chat_id: i64,
         message_id: i64,
     ) -> Result<DeleteOutcome, HandleError> {
-        let url = format!("https://api.telegram.org/bot{}/deleteMessage", self.token);
+        let url = format!("{}/deleteMessage", self.api_base);
         let response = self
             .http
             .post(url)
@@ -325,8 +358,22 @@ fn message_form(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SendOutcome {
-    Sent,
+    Sent(serde_json::Value),
     Rejected(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuoteOutcome {
+    Attached,
+    Missing,
+}
+
+fn is_missing_reply(description: &str) -> bool {
+    let description = description.to_ascii_lowercase();
+    description.contains("reply message not found")
+        || description.contains("replied message not found")
+        || description.contains("message to reply not found")
+        || description.contains("message_id_invalid")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
