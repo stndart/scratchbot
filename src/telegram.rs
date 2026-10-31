@@ -148,7 +148,19 @@ impl Telegram {
                     .and_then(|id| id.as_i64())
                     == Some(reply_to_message_id)
                 {
-                    return Ok(QuoteOutcome::Attached);
+                    let message_id = message
+                        .get("message_id")
+                        .and_then(|id| id.as_i64())
+                        .ok_or_else(|| {
+                            HandleError::Permanent(
+                                "Telegram returned a reply without a message ID".into(),
+                            )
+                        })?;
+                    let date = message
+                        .pointer("/reply_to_message/date")
+                        .and_then(|v| v.as_i64());
+                    tracing::info!(reply_target = reply_to_message_id, reply_message_id = message_id, target_date = ?date, "Telegram confirmed reply target");
+                    return Ok(QuoteOutcome::Attached { message_id, date });
                 }
                 let message_id = message
                     .get("message_id")
@@ -169,6 +181,59 @@ impl Telegram {
                 Ok(QuoteOutcome::Missing)
             }
             SendOutcome::Rejected(description) => Err(HandleError::Permanent(description)),
+        }
+    }
+
+    pub async fn edit_sent_boundary(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        date: Option<i64>,
+    ) -> Result<(), HandleError> {
+        let (text, entities) = boundary_text(date);
+        let url = format!("{}/editMessageText", self.api_base);
+        let payload: ApiResponse<serde_json::Value> = self
+            .http
+            .post(url)
+            .json(&serde_json::json!({
+                "chat_id": chat_id, "message_id": message_id, "text": text, "entities": entities,
+            }))
+            .send()
+            .await
+            .map_err(HandleError::transient)?
+            .json()
+            .await
+            .map_err(HandleError::transient)?;
+        if payload.ok {
+            Ok(())
+        } else {
+            Err(HandleError::Permanent(payload.description.unwrap_or_else(
+                || "Telegram could not update the saved boundary".into(),
+            )))
+        }
+    }
+
+    pub async fn send_sent_boundary(&self, chat_id: i64, date: i64) -> Result<(), HandleError> {
+        let (text, entities) = boundary_text(Some(date));
+        let url = format!("{}/sendMessage", self.api_base);
+        let payload: ApiResponse<serde_json::Value> = self
+            .http
+            .post(url)
+            .json(&serde_json::json!({
+                "chat_id": chat_id, "text": text, "entities": entities,
+            }))
+            .send()
+            .await
+            .map_err(HandleError::transient)?
+            .json()
+            .await
+            .map_err(HandleError::transient)?;
+        if payload.ok {
+            Ok(())
+        } else {
+            Err(HandleError::Permanent(payload.description.unwrap_or_else(
+                || "Telegram could not send the saved boundary".into(),
+            )))
         }
     }
 
@@ -364,8 +429,21 @@ enum SendOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuoteOutcome {
-    Attached,
+    Attached { message_id: i64, date: Option<i64> },
     Missing,
+}
+
+fn boundary_text(date: Option<i64>) -> (String, serde_json::Value) {
+    match date {
+        Some(date) => {
+            let prefix = "Recorded forwards after ";
+            let placeholder = "this date";
+            let text = format!("{prefix}{placeholder} and before this command reached Scratchwall. The boundary forward is also saved; the reply is a shortcut when visible. Check other messages and those at the same time separately before deleting.");
+            let entities = serde_json::json!([{ "type": "date_time", "offset": prefix.len(), "length": placeholder.len(), "unix_time": date, "date_time_format": "dT" }]);
+            (text, entities)
+        }
+        None => ("The recorded forwards from the replied-to message through this command reached Scratchwall. Telegram did not provide its date; check other messages separately before deleting.".into(), serde_json::json!([])),
+    }
 }
 
 fn is_missing_reply(description: &str) -> bool {

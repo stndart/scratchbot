@@ -416,11 +416,12 @@ fn remember(delivered: &mut Delivered, item: &mapping::IncomingItem, status: Del
     ) {
         tracing::warn!(error = %error, "could not remember telegram message outcome");
     }
+    if let Err(error) = delivered.remember_dates(item.user_id, item.chat_id, &item.message_dates) {
+        tracing::warn!(error = %error, "could not remember telegram message dates");
+    }
 }
 
-const SHOW_SENT_QUOTE: &str = "\
-If this message replies to a forward, you can select from that forward to the bottom. \
-The recorded forwards after it reached Scratchwall.";
+const SHOW_SENT_QUOTE: &str = "Checking the saved boundary...";
 
 async fn show_sent(
     telegram: &Telegram,
@@ -481,18 +482,40 @@ async fn show_sent(
         return telegram.send_message(chat_id, text).await;
     }
     tail.sort_by_key(|message| message.message_id);
+    let fallback_date = tail
+        .first()
+        .and_then(|marker| delivered.date(user_id, chat_id, marker.message_id));
     for marker in tail {
         match telegram
             .quote_message(chat_id, marker.message_id, SHOW_SENT_QUOTE)
             .await
         {
-            Ok(QuoteOutcome::Attached) => return Ok(()),
+            Ok(QuoteOutcome::Attached { message_id, date }) => {
+                if let Some(date) = date {
+                    if let Err(error) = delivered.remember_dates(
+                        user_id,
+                        chat_id,
+                        &[(marker.message_id, Some(date))],
+                    ) {
+                        tracing::warn!(error = %error, "could not remember telegram message date");
+                    }
+                }
+                let date = date.or_else(|| delivered.date(user_id, chat_id, marker.message_id));
+                if let Err(error) = telegram.edit_sent_boundary(chat_id, message_id, date).await {
+                    tracing::warn!(error = %error, "could not update saved boundary");
+                    return telegram.send_message(chat_id, "I found a saved forward but could not display its date. Please check messages individually before deleting.").await;
+                }
+                return Ok(());
+            }
             Ok(QuoteOutcome::Missing) => continue,
             Err(error) => {
                 tracing::warn!(error = %error, "could not quote the saved forward");
                 return telegram.send_message(chat_id, "Telegram could not attach a reply to a saved forward. Please try /show-sent again.").await;
             }
         }
+    }
+    if let Some(date) = fallback_date {
+        return telegram.send_sent_boundary(chat_id, date).await;
     }
     telegram.send_message(chat_id, "Telegram could not attach a reply to any saved forward. Please check the chat before deleting messages.").await
 }
@@ -540,9 +563,16 @@ mod tests {
                 match id {
                     10 => Json(serde_json::json!({"ok": true, "result": {"message_id": 100}})),
                     11 => Json(serde_json::json!({"ok": false, "description": "Bad Request: replied message not found"})),
-                    12 => Json(serde_json::json!({"ok": true, "result": {"message_id": 101, "reply_to_message": {"message_id": 12}}})),
+                    12 => Json(serde_json::json!({"ok": true, "result": {"message_id": 101, "reply_to_message": {"message_id": 12, "date": 1793202240}}})),
                     _ => panic!("unexpected reply target"),
                 }
+            }))
+            .route("/editMessageText", post(|State(events): State<Arc<Mutex<Vec<String>>>>, Json(body): Json<serde_json::Value>| async move {
+                assert_eq!(body["message_id"], 101);
+                assert_eq!(body["entities"][0]["unix_time"], 1793202240_i64);
+                assert_eq!(body["entities"][0]["date_time_format"], "dT");
+                events.lock().unwrap().push("dated boundary".into());
+                Json(serde_json::json!({"ok": true, "result": {"message_id": 101}}))
             }))
             .route("/deleteMessage", post(|State(events): State<Arc<Mutex<Vec<String>>>>, axum::Form(form): axum::Form<std::collections::HashMap<String, String>>| async move {
                 events.lock().unwrap().push(format!("delete {}", form["message_id"]));
@@ -562,7 +592,13 @@ mod tests {
         show_sent(&telegram, &mut delivered, 1, 1).await.unwrap();
         assert_eq!(
             *events.lock().unwrap(),
-            ["reply 10", "delete 100", "reply 11", "reply 12"]
+            [
+                "reply 10",
+                "delete 100",
+                "reply 11",
+                "reply 12",
+                "dated boundary"
+            ]
         );
         assert_eq!(
             delivered

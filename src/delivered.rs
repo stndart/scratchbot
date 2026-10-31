@@ -26,6 +26,8 @@ pub struct DeliveredMessage {
 struct DeliveredFile {
     #[serde(default)]
     messages: HashMap<String, Vec<DeliveredMessage>>,
+    #[serde(default)]
+    dates: HashMap<String, i64>,
 }
 
 type MessageOutcomes = BTreeMap<(i64, i64), DeliveryStatus>;
@@ -33,17 +35,49 @@ type MessageOutcomes = BTreeMap<(i64, i64), DeliveryStatus>;
 pub struct Delivered {
     path: PathBuf,
     by_user: HashMap<i64, MessageOutcomes>,
+    dates: HashMap<String, i64>,
 }
 
 impl Delivered {
     pub fn load(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
-        let by_user = match fs::read_to_string(&path) {
+        let (by_user, dates) = match fs::read_to_string(&path) {
             Ok(text) => parse_delivered_file(&text)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                (HashMap::new(), HashMap::new())
+            }
             Err(error) => return Err(error.into()),
         };
-        Ok(Self { path, by_user })
+        Ok(Self {
+            path,
+            by_user,
+            dates,
+        })
+    }
+
+    pub fn date(&self, user_id: i64, chat_id: i64, message_id: i64) -> Option<i64> {
+        self.dates
+            .get(&format!("{user_id}:{chat_id}:{message_id}"))
+            .copied()
+    }
+
+    pub fn remember_dates(
+        &mut self,
+        user_id: i64,
+        chat_id: i64,
+        dates: &[(i64, Option<i64>)],
+    ) -> Result<()> {
+        let mut changed = false;
+        for &(message_id, date) in dates {
+            if let Some(date) = date {
+                let key = format!("{user_id}:{chat_id}:{message_id}");
+                changed |= self.dates.insert(key, date) != Some(date);
+            }
+        }
+        if changed {
+            self.save()?;
+        }
+        Ok(())
     }
 
     pub fn record(
@@ -84,6 +118,10 @@ impl Delivered {
         };
         let mut changed = false;
         for message in messages {
+            self.dates.remove(&format!(
+                "{user_id}:{}:{}",
+                message.chat_id, message.message_id
+            ));
             changed |= entries
                 .remove(&(message.chat_id, message.message_id))
                 .is_some();
@@ -117,7 +155,10 @@ impl Delivered {
         }
         fs::write(
             &self.path,
-            serde_json::to_string_pretty(&DeliveredFile { messages })?,
+            serde_json::to_string_pretty(&DeliveredFile {
+                messages,
+                dates: self.dates.clone(),
+            })?,
         )?;
         Ok(())
     }
@@ -127,7 +168,9 @@ pub fn delivered_path(state_dir: &Path) -> PathBuf {
     state_dir.join("delivered.json")
 }
 
-fn parse_delivered_file(text: &str) -> Result<HashMap<i64, MessageOutcomes>> {
+fn parse_delivered_file(
+    text: &str,
+) -> Result<(HashMap<i64, MessageOutcomes>, HashMap<String, i64>)> {
     let file: DeliveredFile = serde_json::from_str(text)?;
     let mut by_user = HashMap::new();
     for (key, messages) in file.messages {
@@ -140,7 +183,7 @@ fn parse_delivered_file(text: &str) -> Result<HashMap<i64, MessageOutcomes>> {
             .collect();
         by_user.insert(user_id, entries);
     }
-    Ok(by_user)
+    Ok((by_user, file.dates))
 }
 
 impl Delivered {
@@ -186,6 +229,26 @@ pub fn oldest_sent_tail(existing: &[DeliveredMessage]) -> Option<DeliveredMessag
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dates_persist_and_are_removed_with_messages() {
+        let path =
+            std::env::temp_dir().join(format!("scratchwall-dates-{}.json", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let mut delivered = Delivered::load(&path).unwrap();
+        delivered
+            .record(42, 42, [10], DeliveryStatus::Sent)
+            .unwrap();
+        delivered
+            .remember_dates(42, 42, &[(10, Some(12345))])
+            .unwrap();
+        let mut reloaded = Delivered::load(&path).unwrap();
+        assert_eq!(reloaded.date(42, 42, 10), Some(12345));
+        let messages = reloaded.list_for_chat(42, 42);
+        reloaded.remove(42, &messages).unwrap();
+        assert_eq!(Delivered::load(&path).unwrap().date(42, 42, 10), None);
+        let _ = fs::remove_file(path);
+    }
 
     #[test]
     fn records_only_successful_messages_per_chat() {

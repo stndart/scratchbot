@@ -10,6 +10,7 @@ pub struct Update {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Message {
     pub message_id: i64,
+    pub date: Option<i64>,
     pub from: Option<User>,
     pub chat: Chat,
     pub text: Option<String>,
@@ -63,6 +64,7 @@ pub struct IncomingItem {
     pub user_id: i64,
     pub message_id: i64,
     pub message_ids: Vec<i64>,
+    pub message_dates: Vec<(i64, Option<i64>)>,
     pub media_group_id: Option<String>,
     pub body: String,
     pub files: Vec<IncomingFile>,
@@ -228,6 +230,7 @@ pub fn classify(update: &Update, allow: &[i64]) -> Classified {
         user_id: from_id,
         message_id: message.message_id,
         message_ids: vec![message.message_id],
+        message_dates: vec![(message.message_id, message.date)],
         media_group_id: message.media_group_id.clone(),
         body,
         files,

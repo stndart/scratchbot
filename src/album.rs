@@ -61,12 +61,14 @@ pub fn merge_album(mut items: Vec<IncomingItem>) -> IncomingItem {
         .expect("album merge requires at least one item");
     merged.update_ids.clear();
     merged.message_ids.clear();
+    merged.message_dates.clear();
     merged.files.clear();
     merged.body.clear();
     merged.too_large = None;
     for item in items {
         merged.update_ids.extend(item.update_ids);
         merged.message_ids.extend(item.message_ids);
+        merged.message_dates.extend(item.message_dates);
         if merged.body.is_empty() {
             merged.body = item.body;
         }
@@ -91,6 +93,7 @@ mod tests {
             user_id: 42,
             message_id,
             message_ids: vec![message_id],
+            message_dates: vec![(message_id, Some(1000 + message_id))],
             media_group_id: Some("album-1".into()),
             body: caption.into(),
             files: vec![IncomingFile {
