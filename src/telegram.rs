@@ -306,7 +306,10 @@ fn message_form(
         ("text".into(), text.to_owned()),
     ];
     if let Some(reply_to) = reply_to_message_id {
-        form.push(("reply_to_message_id".into(), reply_to.to_string()));
+        form.push((
+            "reply_parameters".into(),
+            serde_json::json!({ "message_id": reply_to }).to_string(),
+        ));
     }
     if let Some(connect) = connect_url {
         form.push((
@@ -500,11 +503,11 @@ mod tests {
             vec![
                 ("chat_id".into(), "42".into()),
                 ("text".into(), "scratchwall ingest 500: boom".into()),
-                ("reply_to_message_id".into(), "99".into()),
+                ("reply_parameters".into(), "{\"message_id\":99}".into()),
             ]
         );
         let command = message_form(42, "Saving to memes.", None, None);
-        assert!(command.iter().all(|(key, _)| key != "reply_to_message_id"));
+        assert!(command.iter().all(|(key, _)| key != "reply_parameters"));
     }
 
     #[test]
