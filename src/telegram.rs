@@ -436,13 +436,13 @@ pub enum QuoteOutcome {
 fn boundary_text(date: Option<i64>) -> (String, serde_json::Value) {
     match date {
         Some(date) => {
-            let prefix = "Recorded forwards after ";
+            let prefix = "Forwards I recorded after ";
             let placeholder = "this date";
-            let text = format!("{prefix}{placeholder} and before this command reached Scratchwall. The boundary forward is also saved; the reply is a shortcut when visible. Check other messages and those at the same time separately before deleting.");
+            let text = format!("{prefix}{placeholder} and before this command are saved to Scratchwall. Check other messages and those sent at that exact time before deleting.");
             let entities = serde_json::json!([{ "type": "date_time", "offset": prefix.len(), "length": placeholder.len(), "unix_time": date, "date_time_format": "dT" }]);
             (text, entities)
         }
-        None => ("The recorded forwards from the replied-to message through this command reached Scratchwall. Telegram did not provide its date; check other messages separately before deleting.".into(), serde_json::json!([])),
+        None => ("The replied-to forward and later forwards I recorded before this command are saved to Scratchwall. The date is unavailable; check other messages before deleting.".into(), serde_json::json!([])),
     }
 }
 
