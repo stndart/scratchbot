@@ -14,6 +14,7 @@ pub struct Message {
     pub from: Option<User>,
     pub chat: Chat,
     pub text: Option<String>,
+    pub reply_to_message: Option<ReplyToMessage>,
     pub caption: Option<String>,
     pub media_group_id: Option<String>,
     #[serde(default)]
@@ -33,6 +34,13 @@ pub struct User {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Chat {
     pub id: i64,
+    #[serde(rename = "type")]
+    pub kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReplyToMessage {
+    pub message_id: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -81,6 +89,7 @@ pub enum Command {
     Space { name: Option<String> },
     Login { name: Option<String> },
     Clear,
+    Delete { reply_to_message_id: Option<i64> },
     ShowSent,
     Unknown(String),
 }
@@ -133,6 +142,9 @@ pub fn parse_command(text: &str) -> Option<Command> {
     match cmd.as_str() {
         "/start" | "/help" => Some(Command::Start),
         "/clear" => Some(Command::Clear),
+        "/delete" => Some(Command::Delete {
+            reply_to_message_id: None,
+        }),
         "/show-sent" => Some(Command::ShowSent),
         "/space" => {
             let name = rest.trim();
@@ -161,8 +173,19 @@ pub fn classify(update: &Update, allow: &[i64]) -> Classified {
         return Classified::Ignored;
     }
     if let Some(text) = message.text.as_deref()
-        && let Some(command) = parse_command(text)
+        && let Some(mut command) = parse_command(text)
     {
+        if let Command::Delete {
+            reply_to_message_id,
+        } = &mut command
+            && message.chat.kind.as_deref() == Some("private")
+        {
+            *reply_to_message_id = message
+                .reply_to_message
+                .as_ref()
+                .map(|reply| reply.message_id)
+                .filter(|&id| id > 0);
+        }
         return Classified::Command {
             chat_id: message.chat.id,
             user_id: from_id,
@@ -373,6 +396,40 @@ mod tests {
                 command: Command::Clear
             }
         );
+    }
+
+    #[test]
+    fn delete_command_targets_only_a_reply_in_a_private_chat() {
+        let mut update = parse(
+            r#"{
+                "update_id": 105,
+                "message": {
+                    "message_id": 9,
+                    "from": {"id": 42},
+                    "chat": {"id": 42, "type": "private"},
+                    "text": "/delete@ScratchwallBot",
+                    "reply_to_message": {"message_id": 7}
+                }
+            }"#,
+        );
+        let classified = |reply_to_message_id| Classified::Command {
+            chat_id: 42,
+            user_id: 42,
+            message_id: 9,
+            command: Command::Delete {
+                reply_to_message_id,
+            },
+        };
+        assert_eq!(classify(&update, &[42]), classified(Some(7)));
+        assert_eq!(classify(&update, &[23]), Classified::Ignored);
+
+        update.message.as_mut().unwrap().chat.kind = Some("supergroup".into());
+        assert_eq!(classify(&update, &[42]), classified(None));
+
+        let message = update.message.as_mut().unwrap();
+        message.chat.kind = Some("private".into());
+        message.reply_to_message = None;
+        assert_eq!(classify(&update, &[42]), classified(None));
     }
 
     #[test]

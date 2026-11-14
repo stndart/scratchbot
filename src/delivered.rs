@@ -7,6 +7,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+const MARK_REMOVED: &str = "UPDATE messages SET removed=1,clear_blocked=0
+    WHERE user_id=? AND chat_id=? AND message_id=?";
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryStatus {
@@ -276,11 +279,18 @@ impl Delivered {
     pub fn remove(&mut self, user_id: i64, messages: &[DeliveredMessage]) -> Result<()> {
         let tx = self.db.transaction()?;
         for m in messages {
-            tx.execute("UPDATE messages SET removed=1,clear_blocked=0 WHERE user_id=? AND chat_id=? AND message_id=?",params![user_id,m.chat_id,m.message_id])?;
+            tx.execute(MARK_REMOVED, params![user_id, m.chat_id, m.message_id])?;
         }
         tx.commit()?;
         Ok(())
     }
+
+    pub fn remove_one(&self, user_id: i64, chat_id: i64, message_id: i64) -> Result<()> {
+        self.db
+            .execute(MARK_REMOVED, params![user_id, chat_id, message_id])?;
+        Ok(())
+    }
+
     pub fn mark_clear_blocked(&mut self, user_id: i64, m: DeliveredMessage) -> Result<()> {
         self.db.execute(
             "UPDATE messages SET clear_blocked=1 WHERE user_id=? AND chat_id=? AND message_id=?",

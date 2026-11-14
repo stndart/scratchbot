@@ -123,8 +123,10 @@ async fn run() -> Result<()> {
                     message_id,
                     command,
                 } => {
-                    if matches!(command, Command::Clear | Command::ShowSent)
-                        && (albums.has_pending() || !pending_commands.is_empty())
+                    if matches!(
+                        command,
+                        Command::Clear | Command::Delete { .. } | Command::ShowSent
+                    ) && (albums.has_pending() || !pending_commands.is_empty())
                     {
                         pending_commands
                             .insert(update.update_id, (chat_id, user_id, message_id, command));
@@ -242,6 +244,7 @@ Connect Scratchwall, then pick a folder, then forward memes.\n\
 /login — connect your Scratchwall account\n\
 /space Name — folder; created on first save if missing.\n\
 /clear — delete Telegram copies from the last 48 hours that already reached Scratchwall.\n\
+/delete — reply to a message in this private bot chat to delete it for both sides.\n\
 /show-sent — quote the oldest saved forward you can delete by hand down to the bottom.",
                 )
                 .await
@@ -264,6 +267,9 @@ Connect Scratchwall, then pick a folder, then forward memes.\n\
         Command::Clear => {
             clear_delivered(telegram, delivered, chat_id, user_id, command_message_id).await
         }
+        Command::Delete {
+            reply_to_message_id,
+        } => delete_reply(telegram, delivered, chat_id, user_id, reply_to_message_id).await,
         Command::ShowSent => {
             show_sent(telegram, delivered, chat_id, user_id, command_message_id).await
         }
@@ -272,7 +278,7 @@ Connect Scratchwall, then pick a folder, then forward memes.\n\
                 .send_message(
                     chat_id,
                     &format!(
-                        "Unknown command {name}. Try /login, /space Name, /clear, and /show-sent."
+                        "Unknown command {name}. Try /login, /space Name, /clear, /delete, or /show-sent."
                     ),
                 )
                 .await
@@ -415,6 +421,39 @@ async fn handle_batch(
             Ok(())
         }
     }
+}
+
+async fn delete_reply(
+    telegram: &Telegram,
+    delivered: &Delivered,
+    chat_id: i64,
+    user_id: i64,
+    reply_to_message_id: Option<i64>,
+) -> Result<(), HandleError> {
+    let Some(message_id) = reply_to_message_id else {
+        return telegram
+            .send_message(
+                chat_id,
+                "Use /delete as a reply to a message in your private chat with the bot.",
+            )
+            .await;
+    };
+
+    let outcome = telegram.delete_message(chat_id, message_id).await;
+    if matches!(outcome, Ok(DeleteOutcome::Deleted | DeleteOutcome::Gone)) {
+        delivered
+            .remove_one(user_id, chat_id, message_id)
+            .map_err(HandleError::transient)?;
+    }
+    let text = match outcome {
+        Ok(DeleteOutcome::Deleted) => "Deleted that message for both sides.",
+        Ok(DeleteOutcome::Gone) => "Telegram couldn't find that message in this chat.",
+        Ok(DeleteOutcome::Forbidden) => {
+            "Telegram couldn't delete that message. Bots can generally delete messages sent within the last 48 hours."
+        }
+        Err(_) => "Telegram couldn't confirm deletion. Try again if the message is still there.",
+    };
+    telegram.send_message(chat_id, text).await
 }
 
 async fn clear_delivered(
@@ -829,6 +868,50 @@ mod tests {
             self.server.abort();
             let _ = std::fs::remove_dir_all(&self.directory);
         }
+    }
+
+    #[tokio::test]
+    async fn delete_reply_removes_only_the_target_even_after_failed_delivery() {
+        let mut f = Fixture::new().await;
+        f.seed(3, DeliveryStatus::Sent, true, false);
+        f.seed(4, DeliveryStatus::Failed, true, false);
+
+        delete_reply(&f.telegram, &f.delivered, 1, 1, Some(4))
+            .await
+            .unwrap();
+
+        let history = f.delivered.history_for_chat(1, 1).unwrap();
+        assert!(!history[0].removed);
+        assert!(history[1].removed);
+        assert_eq!(history[1].date, Some(400));
+        assert_eq!(history[1].status, DeliveryStatus::Failed);
+        let state = f.state.lock().unwrap();
+        assert_eq!(state.events, ["delete 4", "report None"]);
+        assert_eq!(
+            state.reports[0]["text"],
+            "Deleted that message for both sides."
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_reply_reports_refusal_and_preserves_the_copy() {
+        let mut f = Fixture::new().await;
+        f.seed(4, DeliveryStatus::Sent, true, false);
+        f.state.lock().unwrap().blocked.insert(4);
+
+        delete_reply(&f.telegram, &f.delivered, 1, 1, Some(4))
+            .await
+            .unwrap();
+
+        assert!(!f.delivered.history_for_chat(1, 1).unwrap()[0].removed);
+        let state = f.state.lock().unwrap();
+        assert!(state.alive.contains_key(&4));
+        assert!(
+            state.reports[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("48 hours")
+        );
     }
 
     #[tokio::test]
